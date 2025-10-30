@@ -45,7 +45,7 @@ parser.add_argument(
     "--ml_framework",
     type=str,
     default="torch",
-    choices=["torch", "jax", "jax-numpy"],
+    choices=["torch"],
     help="The ML framework used for training the skrl agent.",
 )
 parser.add_argument(
@@ -91,10 +91,12 @@ if version.parse(skrl.__version__) < version.parse(SKRL_VERSION):
     )
     exit()
 
-if args_cli.ml_framework.startswith("torch"):
-    from skrl.utils.runner.torch import Runner
-elif args_cli.ml_framework.startswith("jax"):
-    from skrl.utils.runner.jax import Runner
+from skrl.memories.torch import RandomMemory
+from skrl.agents.torch.ppo import PPO_RNN
+from skrl.trainers.torch import SequentialTrainer
+from skrl.resources.preprocessors.torch import RunningStandardScaler
+from skrl.resources.schedulers.torch import KLAdaptiveLR
+from skrl.utils import set_seed
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -113,11 +115,12 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import ChargeProject.tasks  # noqa: F401
+from ChargeProject.tasks.direct.chargeproject.agents.skrl_custom_ppo_model import SharedRecurrentModel
 
 # config shortcuts
 if args_cli.agent is None:
     algorithm = args_cli.algorithm.lower()
-    agent_cfg_entry_point = "skrl_cfg_entry_point" if algorithm in ["ppo"] else f"skrl_{algorithm}_cfg_entry_point"
+    agent_cfg_entry_point = "skrl_custom_cfg_entry_point" if algorithm in ["ppo"] else f"skrl_custom_{algorithm}_cfg_entry_point"
 else:
     agent_cfg_entry_point = args_cli.agent
 
@@ -126,8 +129,6 @@ import torch  # Make sure torch is imported
 
 @hydra_task_config(args_cli.task, agent_cfg_entry_point)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
-    print("---------------")
-    print(agent_cfg_entry_point, agent_cfg)
     """Train with skrl agent."""
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
@@ -140,9 +141,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.max_iterations:
         agent_cfg["trainer"]["timesteps"] = args_cli.max_iterations * agent_cfg["agent"]["rollouts"]
     agent_cfg["trainer"]["close_environment_at_exit"] = False
-    # configure the ML framework into the global skrl variable
-    if args_cli.ml_framework.startswith("jax"):
-        skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
 
     # randomly sample a seed if seed = -1
     if args_cli.seed == -1:
@@ -208,24 +206,56 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
+    set_seed(agent_cfg["seed"])
+
     # wrap around environment for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
 
-    # configure and instantiate the skrl runner
-    # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
-    runner = Runner(env, agent_cfg)
+    device = env.device
 
-    env_cfg._agent = runner.agent  # to access the agent from within the env for logging
-    print(dir(runner))
-    runner.agent.env = runner._env # to access terminations/truncations from within the agent for LSTM state reset
+    memory = RandomMemory(memory_size=agent_cfg["agent"]["rollouts"], num_envs=env.num_envs, device=device)
+
+    models = {}
+    models["policy"] = SharedRecurrentModel(
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device=device,
+        num_envs=env.num_envs,
+        init_log_std=agent_cfg["model"]["log_std_init"],
+        #gain=agent_cfg["model"].get("gain", 1.0),
+    )
+    models["value"] = models["policy"]
+
+    cfg = agent_cfg["agent"].copy()
+    # override learning_rate_scheduler with the class
+    #cfg["learning_rate_scheduler"] = KLAdaptiveLR
+    shaper_scale = cfg.get("rewards_shaper_scale", 1.0)
+    cfg["rewards_shaper"] = lambda rewards, *args, **kwargs: rewards * shaper_scale
+    cfg["state_preprocessor"] = RunningStandardScaler
+    cfg["state_preprocessor_kwargs"] = {"size": env.observation_space, "device": device}
+    cfg["value_preprocessor"] = RunningStandardScaler
+    cfg["value_preprocessor_kwargs"] = {"size": 1, "device": device}
+
+    agent = PPO_RNN(
+        models=models,
+        memory=memory,
+        cfg=cfg,
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device=device,
+    )
 
     # load checkpoint (if specified)
     if resume_path:
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
-        runner.agent.load(resume_path)
+        agent.load(resume_path)
     torch.cuda.profiler.start()
+
     # run training
-    runner.run()
+    cfg_trainer = agent_cfg["trainer"].copy()
+    trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
+    
+    trainer.train()
 
     # close the simulator
     env.close()

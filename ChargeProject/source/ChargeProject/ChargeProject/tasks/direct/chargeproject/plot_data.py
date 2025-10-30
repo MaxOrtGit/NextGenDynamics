@@ -11,7 +11,8 @@ log_dir = None
 POLL_INTERVAL = 1
 # Window size for the moving average. Set to 1 to disable smoothing.
 SMOOTHING_WINDOW = 1
-#log_dir = "logs\\skrl\\quadre\\2025-09-23_10-04-10_ppo_torch_Load both next dist"
+#log_dir = r"C:\School\NextGenDynamics\ChargeProject\logs\skrl\spiderbot\2025-10-21_10-22-17_ppo_torch"
+base_log_dir = "logs/skrl/spiderbot"
 
 
 # Parses tfevents into a DataFrame
@@ -23,11 +24,11 @@ def parse_tfevents_to_dataframe(acc):
     all_data = []
     for tag in tags:
         # Filter for only the reward-related tags at the source
-        if tag.startswith('Episode_Reward/'):
+        if tag.startswith('Info / Episode_Reward/'):
             events = acc.Scalars(tag)
             for event in events:
                 all_data.append({
-                    'tag': tag,
+                    'tag': tag.replace('Info / Episode_Reward/', ''),
                     'step': event.step,
                     'value': event.value
                 })
@@ -39,7 +40,6 @@ def parse_tfevents_to_dataframe(acc):
 
 # If log_dir is not set get the latest folder in logs/skrl/quadre
 if log_dir is None:
-    base_log_dir = "logs/skrl/quadre"
     all_runs = glob.glob(os.path.join(base_log_dir, "*"))
     log_dir = max(all_runs, key=os.path.getmtime)
     print(f"No log_dir specified. Using the latest run: {log_dir}")
@@ -114,10 +114,18 @@ try:
         ax.autoscale_view()
         
         # Redraw the canvas
-        fig.tight_layout(rect=[0, 0, 0.85, 1]) # Adjust for legend
+        fig.tight_layout(rect=[0, 0, 0.9, 1]) # Adjust for legend
         fig.canvas.draw()
         fig.canvas.flush_events()
-        
+        # print the most recent reward values to console
+        """
+        for tag_name, line in lines.items():
+            xdata = line.get_xdata()
+            ydata = line.get_ydata()
+            if len(xdata) > 0:
+                print(f"{tag_name}: {ydata[-1]:.2f}")
+        """
+
         plt.pause(POLL_INTERVAL)
 
 except KeyboardInterrupt:
@@ -128,3 +136,4 @@ finally:
     # plt.savefig("final_reward_plot.png", dpi=300)
     print("Final plot window is open. You can close it manually.")
     plt.show() # Show the final plot and block until closed
+    

@@ -42,22 +42,15 @@
             "name": "Python: Train Environment",
             "type": "python",
             "request": "launch",
-            "args" : ["--task", "Chargeproject-Direct-v0", "--headless", "--video", "--video_interval", "1000", "--video_length", "1000",
-                      // Speed forward
-                      // "--checkpoint", "checkpoints/runs_forward_fast.pt"
-                      // More turning
-                      //"--checkpoint", "checkpoints/forward_and_slight_target.pt"
-                      // Better turning
-                      //"--checkpoint", "checkpoints/decent_target.pt"
-                      // target tracking
-                      //"--checkpoint", "checkpoints/goes_between_targets.pt"
-                      // target tracking v1
-                      //"--checkpoint", "checkpoints/point_to_point_v1.2.pt"
-                      "--checkpoint", "checkpoints/point_to_point_v2.3.pt"
+            "args" : ["--task", "Chargeproject-Direct-v0", "--headless",
+                      "--video", "--video_interval", "250", "--video_length", "250", // "--rendering_mode", "performance",
+                      //"--checkpoint", "checkpoints/Spider/spiderbot_v3.4.0.pt"
                     ],
-            "program": "${workspaceFolder}/scripts/skrl/train.py",
-            //"program": "${workspaceFolder}/scripts/rsl_rl/train.py",
-            "console": "integratedTerminal"
+            "program": "${workspaceFolder}/scripts/skrlcustom/train.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_LAUNCH_BLOCKING": "1"
+            }
         },
         {
             "name": "Python: Play Environment",

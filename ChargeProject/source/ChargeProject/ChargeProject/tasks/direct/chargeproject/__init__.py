@@ -24,6 +24,9 @@ gym.register(
         #"rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         #"skrl_amp_cfg_entry_point": f"{agents.__name__}:skrl_amp_cfg.yaml",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "skrl_custom_cfg_entry_point": f"{agents.__name__}:skrl_custom_ppo_cfg.yaml",
+        # Hard coded
+        #"skrl_custom_model_entry_point": f"{__name__}.agents.skrl_custom_ppo_model:SharedRecurrentModel",
         #"sb3_cfg_entry_point": f"{agents.__name__}:sb3_ppo_cfg.yaml",
     },
 )
