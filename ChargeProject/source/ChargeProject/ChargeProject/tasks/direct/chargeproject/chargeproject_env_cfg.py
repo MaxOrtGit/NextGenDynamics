@@ -59,7 +59,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     # - spaces definition
     action_space = 24
     observation_space = spaces.Dict({
-        "observations": spaces.Box(-math.inf, math.inf, shape=(90,), dtype=float),
+        "observations": spaces.Box(-math.inf, math.inf, shape=(98,), dtype=float),
         "height_data": spaces.Box(-math.inf, math.inf, shape=(25, 25), dtype=float),
         "nav_data": spaces.Box(-math.inf, math.inf, shape=(3, 33, 33), dtype=float)
     })
@@ -136,7 +136,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=int(1),#1024*0.25),#0),
+        num_envs=int(1024*0.5),#0),
         env_spacing=4.0, 
         replicate_physics=True
     )
@@ -161,7 +161,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     )
 
 
-    visualize_nav_data = True
+    visualize_nav_data = False
     lidar_scanner = RayCasterCfg(
         prim_path=f"/World/envs/env_.*/Robot/{base_name}",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.4)),
@@ -233,11 +233,10 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     #   do ==, divide torques
 
     #  1e-4 then set to 1e-3 for faster learning
-    progress_reward_scale = 2000 / 6 / 5 * 1.5 * 2 # * 2 # Remove (*2) after init # -- added / 6 # ---- add / 5 # ----- add * 1.5 # = add * 2
-    progress_pow = 1#.4
-    distance_lookback = 10
 
-    velocity_alignment_reward_scale = 120 / 6 * 1.5 # * 4 # Remove (*4) after init # -- added / 6 # ---- add * 1.5 # ----- add * 1.5
+    # --- Reward Scales ---
+    exploration_reward_scale = 0.5
+
     # Multiplied by targets hit reward
     reach_target_reward_scale = 1000 * 4 # == add * 4
     death_penalty_scale = -2000

@@ -169,6 +169,9 @@ class ChargeprojectEnv(DirectRLEnv):
         # Different for each state
         self.state_timers = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
+
+        self._prev_total_staleness = torch.zeros(self.num_envs, device=self.device)
+
         # For storing data like last known player position or investigation point
         self.nav_targets = torch.zeros(self.num_envs, 3, device=self.device)
         
@@ -261,7 +264,6 @@ class ChargeprojectEnv(DirectRLEnv):
             self.loco_height_data = loco_map
             self._visualize_markers()
 
-        index = self._sim_step_counter % self.cfg.distance_lookback
 
     def _apply_action(self) -> None:
         normalized_actions = self._actions.view(self._actions.shape[0], -1)
@@ -304,6 +306,13 @@ class ChargeprojectEnv(DirectRLEnv):
             > 1.0
         )
         
+        
+        nav_data, height_data, far_staleness, self.last_exploration_bonus = self.map_manager.update(
+            self._robot.data.root_pos_w,
+            self._robot.data.heading_w.unsqueeze(-1),
+            self._lidar_sensor.data.ray_hits_w,
+        )
+
 
         # Concatenate the selected observations into a single tensor.
         obs = torch.cat(
@@ -321,14 +330,11 @@ class ChargeprojectEnv(DirectRLEnv):
 
                 # Player relative position
                 self._player.data.root_pos_w - self._robot.data.root_pos_w,
+
+                # Staleness info
+                far_staleness,
             ],
             dim=-1,
-        )
-
-        nav_data, height_data = self.map_manager.update(
-            self._robot.data.root_pos_w,
-            self._robot.data.heading_w.unsqueeze(-1),
-            self._lidar_sensor.data.ray_hits_w,
         )
 
         observations = {
@@ -343,40 +349,11 @@ class ChargeprojectEnv(DirectRLEnv):
 
     def _get_rewards(self) -> torch.Tensor:
 
-        # Check if distance is within tolerance
-        #target_distance = torch.linalg.norm(self._desired_pos - self._robot.data.root_pos_w[:, :2], dim=1)
-        #reached_target = target_distance.squeeze(-1) < self.cfg.success_tolerance
-        #reached_target_ids = reached_target.nonzero(as_tuple=False).squeeze(-1)
-
-        # Generate a new target immediately for the environments that reached theirs
-        #if len(reached_target_ids) > 0:
-        #    self._move_next_targets(reached_target_ids)
-
         
-        #target_unit_vector, target_distance = self._get_relative_target_info(self._desired_pos)
-
-        # - Rewards -
-        # Reward for progress towards the target
-        #sum_valid = torch.nansum(self._distance_buffer, dim=1)
-        #count_valid = torch.clamp(torch.sum(~torch.isnan(self._distance_buffer), dim=1), min=1.0)
-        #previous_buffered_distance = sum_valid / count_valid
-        #difference = (previous_buffered_distance - target_distance.squeeze(-1)) * (1 + 0.5 * (count_valid-1))
-        #if self.cfg.progress_pow != 1.0: 
-        #    progress_reward = torch.sign(difference) * torch.pow(torch.abs(difference), self.cfg.progress_pow)
-        #else:
-        #    progress_reward = difference
-        #progress_reward = difference
-        #progress_reward *= torch.log1p(self._targets_reached/2) + 1
-
         # Reward for moving (average of buffer is = to this)
         movement_reward = torch.linalg.norm(self._robot.data.root_lin_vel_b[:, :2], dim=1)
 
-        
-        # Velocity alignment the target
-        #velocity_alignment_reward = torch.nn.functional.cosine_similarity(
-        #   self._robot.data.root_lin_vel_w[:, :2], target_unit_vector, dim=1
-        #)
-
+    
         # Bonus for getting to target
         target_reward = torch.zeros(self.num_envs, device=self.device)
         #target_reward[reached_target_ids] = torch.log1p(self._targets_reached[reached_target_ids]) + 1
@@ -540,8 +517,7 @@ class ChargeprojectEnv(DirectRLEnv):
 
 
         rewards = {
-            #"progress_reward": progress_reward * self.cfg.progress_reward_scale * self.step_dt,
-            #"velocity_alignment_reward": velocity_alignment_reward * self.cfg.velocity_alignment_reward_scale * self.step_dt,
+            "exploration_reward": self.last_exploration_bonus * self.cfg.exploration_reward_scale * self.step_dt,
             "reach_target_reward": target_reward * self.cfg.reach_target_reward_scale * self.step_dt,
             "death_penalty": death_penalty * self.cfg.death_penalty_scale * self.step_dt,
             "movement_reward": movement_reward * self.cfg.movement_reward_scale * self.step_dt,
@@ -901,4 +877,3 @@ class ChargeprojectEnv(DirectRLEnv):
             scales=nav_scales,
             marker_indices=nav_indices
         )
-        

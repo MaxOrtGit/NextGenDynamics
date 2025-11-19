@@ -3,8 +3,6 @@ import torch.nn.functional as F
 import numpy as np
 from pxr import UsdGeom
 import omni.usd
-
-# Import the specific Isaac Lab functions we need
 from isaaclab.sensors import RayCasterCfg, patterns
 from isaaclab.utils.warp import convert_to_warp_mesh, raycast_mesh
 import isaaclab.sim as sim_utils
@@ -22,12 +20,21 @@ class MapManager:
 
         # --- Initialization ---
         ground_prim_path = "/World/ground"
-        print(f"[MapManager] Scanning World at '{ground_prim_path}'...")
+        # ... (Keep existing initialization code) ...
         self.global_height_map = self._scan_entire_world(ground_prim_path)
-        print(f"[MapManager] Scan complete. Map shape: {self.global_height_map.shape}")
         
         # Initialize per-env staleness (1.0 = Stale/Dusty)
         self.staleness_maps = torch.ones(self.num_envs, 1, self.config.staleness_dim, self.config.staleness_dim, device=device)
+        
+        # Pre-calculate 8 cardinal relative offsets (Radius = 12.0m)
+        # Angles: 0 (Front), 45, 90 (Left), 135, 180 (Back), etc.
+        scan_radius = 12.0 
+        angles = torch.arange(0, 2*np.pi, 2*np.pi/8, device=device)
+        self.far_sensor_offsets = torch.stack([
+            scan_radius * torch.cos(angles),
+            scan_radius * torch.sin(angles)
+        ], dim=1) # (8, 2)
+
     
     def _scan_entire_world(self, ground_prim_path):
         rows = int(self.world_h / self.config.height_res) + 1
@@ -95,15 +102,18 @@ class MapManager:
         height_map = ground_z.view(1, 1, rows, cols)
         
         return height_map
-    
-    def update(self, robot_pos_w, robot_yaw_w, lidar_hits_w):
-        # Update Staleness Logic (Decay + Clear)
-        self._update_staleness_map(lidar_hits_w)
 
-        # Generate Observations
+    def update(self, robot_pos_w, robot_yaw_w, lidar_hits_w):
+        # 1. Update Staleness & Calculate Reward (Amount Cleared)
+        cleared_value = self._update_staleness_map(lidar_hits_w)
+
+        # 2. Sample Far Sensors (8 Cardinal Directions)
+        far_staleness = self._get_far_staleness(robot_pos_w, robot_yaw_w)
+
+        # 3. Generate Standard Observations
         nav_map, loco_map = self._sample_egocentric_maps(robot_pos_w, robot_yaw_w, lidar_hits_w)
         
-        return nav_map, loco_map
+        return nav_map, loco_map, far_staleness, cleared_value
 
     def _update_staleness_map(self, lidar_hits_w):
         # Decay (Everything gets dusty)
@@ -113,7 +123,7 @@ class MapManager:
         # Calculate hits relative to Env Origin
         rel_hits = lidar_hits_w - self.env_origins.unsqueeze(1)
         
-        # Map to Pixel Coordinates (0 to 96)
+        # Map to Pixel Coordinates
         half_size = self.config.patrol_size / 2
         col = ((rel_hits[..., 0] + half_size) / self.config.patrol_size * self.config.staleness_dim).long()
         row = ((rel_hits[..., 1] + half_size) / self.config.patrol_size * self.config.staleness_dim).long()
@@ -121,18 +131,77 @@ class MapManager:
         # Filter valid hits within patrol zone
         mask = (col >= 0) & (col < self.config.staleness_dim) & (row >= 0) & (row < self.config.staleness_dim)
         
-        # Scatter Clear
-        # Index = batch * (H*W) + row * W + col
+        # Identify indices to clear
         batch_ids = torch.arange(self.num_envs, device=self.device).unsqueeze(1).expand_as(col)
+        # Linear index for flatten: B * (H*W) + Row * W + Col
         flat_idx = batch_ids * (self.config.staleness_dim**2) + row * self.config.staleness_dim + col
         
         valid_idx = flat_idx[mask]
         
+        total_cleared_value = torch.zeros(self.num_envs, device=self.device)
+        
         if valid_idx.numel() > 0:
-            # Flatten, clear, reshape
             flat_map = self.staleness_maps.view(-1)
+            
+            # --- Exploration Reward Calculation ---
+            # Get values before we clear them
+            # Note: Multiple rays might hit the same cell. We should only count unique cells to prevent reward hacking
+            # by staring at the same spot. 
+            unique_idx, _ = torch.unique(valid_idx, return_inverse=True)
+            
+            # Map unique indices back to environment IDs
+            # We know index = env_id * dim^2 + ...
+            env_ids_for_unique = torch.div(unique_idx, (self.config.staleness_dim**2), rounding_mode='floor')
+            
+            values_to_clear = flat_map[unique_idx]
+            
+            # Sum values per environment
+            total_cleared_value.index_add_(0, env_ids_for_unique, values_to_clear)
+            
+            # Clear map
             flat_map[valid_idx] = 0.0 
             self.staleness_maps = flat_map.view(self.num_envs, 1, self.config.staleness_dim, self.config.staleness_dim)
+            
+        return total_cleared_value
+
+    def _get_far_staleness(self, robot_pos_w, robot_yaw_w):
+        """Samples staleness at 8 cardinal directions rotated by robot yaw."""
+        cos = torch.cos(robot_yaw_w).squeeze(-1)
+        sin = torch.sin(robot_yaw_w).squeeze(-1)
+        
+        # 1. Rotate offsets by Robot Yaw
+        # (N, 1, 2) * (1, 8, 2) broadcast is tricky, let's do manual rotation
+        # offsets: (8, 2) -> x, y
+        x_off = self.far_sensor_offsets[:, 0] # (8)
+        y_off = self.far_sensor_offsets[:, 1] # (8)
+        
+        # Rotated offsets (N, 8)
+        # x' = x cos - y sin
+        # y' = x sin + y cos
+        rx = x_off.unsqueeze(0) * cos.unsqueeze(1) - y_off.unsqueeze(0) * sin.unsqueeze(1)
+        ry = x_off.unsqueeze(0) * sin.unsqueeze(1) + y_off.unsqueeze(0) * cos.unsqueeze(1)
+        
+        # 2. Add to Robot Position to get World Position
+        # (N, 1) + (N, 8)
+        px = robot_pos_w[:, 0].unsqueeze(1) + rx
+        py = robot_pos_w[:, 1].unsqueeze(1) + ry
+        
+        # 3. Normalize to [-1, 1] grid coordinates relative to Patrol Box
+        # grid = (pos - env_origin) / (patrol_size/2)
+        rel_x = px - self.env_origins[:, 0].unsqueeze(1)
+        rel_y = py - self.env_origins[:, 1].unsqueeze(1)
+        
+        norm_x = rel_x / (self.config.patrol_size / 2.0)
+        norm_y = rel_y / (self.config.patrol_size / 2.0)
+        
+        # Stack for grid_sample: (N, 1, 8, 2) -> Treated as a "Line" image of width 8
+        grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(1)
+        
+        # 4. Sample
+        # Output: (N, 1, 1, 8)
+        samples = F.grid_sample(self.staleness_maps, grid, align_corners=False, padding_mode='border')
+        
+        return samples.view(self.num_envs, 8)
 
     def _sample_egocentric_maps(self, robot_pos_w, robot_yaw_w, lidar_hits_w):
         cos = torch.cos(robot_yaw_w).squeeze(-1)
