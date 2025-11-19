@@ -84,7 +84,6 @@ SPIDER_ACTUATOR_CFG = ImplicitActuatorCfg(
         "joint_leg_upper_leg_middle_.*",
         "joint_leg_middle_leg_lower_.*",
     ],
-    
     effort_limit_sim={
         "joint_body_leg_hip_.*": 20,
         "joint_leg_hip_leg_upper_.*": 40.0,
@@ -97,7 +96,7 @@ SPIDER_ACTUATOR_CFG = ImplicitActuatorCfg(
         "joint_leg_upper_leg_middle_.*": 80,
         "joint_leg_middle_leg_lower_.*": 50,
     },
-    velocity_limit_sim=500,
+    velocity_limit_sim=100,
     damping={
         "joint_body_leg_hip_.*": 0.8,
         "joint_leg_hip_leg_upper_.*": 1.6,
@@ -136,7 +135,7 @@ SPIDER_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.5),  # start above the ground
+        pos=(0.0, 0.0, 0.525),  # start above the ground
         # Default angles: body-hip=0°, hip-upper=30°, upper-middle=-65°, middle--lower=-55°
         joint_pos=SPIDER_JOINT_INFO["default_pos"],
     ),

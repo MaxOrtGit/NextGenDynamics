@@ -15,12 +15,13 @@ from isaaclab.sim.spawners.materials.physics_materials_cfg import RigidBodyMater
 #from ChargeProject.tasks.direct.chargeproject.environments import MySceneCfg, ROBOT_CFG
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg
+from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.sim import SimulationCfg, PhysxCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
+from .natural_terrain import terrain_gen_cfg
 from .spider_robot import SPIDER_CFG
 
 from isaaclab.terrains import TerrainImporterCfg
@@ -33,40 +34,15 @@ import isaaclab.terrains as terrain_gen
 SIMPLER_ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
     size=(8.0, 8.0),
     border_width=20.0,
-    num_rows=10,
-    num_cols=20,
+    num_rows=1,
+    num_cols=1,
     horizontal_scale=0.1,
     vertical_scale=0.005,
     slope_threshold=0.75,
     use_cache=False,
     sub_terrains={
-        "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
-            proportion=0.2,
-            step_height_range=(0.03, 0.12),
-            step_width=0.3,
-            platform_width=3.0,
-            border_width=1.0,
-            holes=False,
-        ),
-        "pyramid_stairs_inv": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
-            proportion=0.2,
-            step_height_range=(0.03, 0.12),
-            step_width=0.3,
-            platform_width=3.0,
-            border_width=1.0,
-            holes=False,
-        ),
         "boxes": terrain_gen.MeshRandomGridTerrainCfg(
-            proportion=0.25, grid_width=0.45, grid_height_range=(0.05, 0.12), platform_width=2.0
-        ),
-        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-            proportion=0.15, noise_range=(0.01, 0.06), noise_step=0.02, border_width=0.25
-        ),
-        "hf_pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
-            proportion=0.1, slope_range=(0.0, 0.3), platform_width=2.0, border_width=0.25
-        ),
-        "hf_pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
-            proportion=0.1, slope_range=(0.0, 0.3), platform_width=2.0, border_width=0.25
+            proportion=1.0, grid_width=0.45, grid_height_range=(0.05, 1.0), platform_width=2.0
         ),
     },
 )
@@ -83,8 +59,9 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     # - spaces definition
     action_space = 24
     observation_space = spaces.Dict({
-        "observations": spaces.Box(-math.inf, math.inf, shape=(87,), dtype=float),
-        "height_data": spaces.Box(-math.inf, math.inf, shape=(16, 16), dtype=float)
+        "observations": spaces.Box(-math.inf, math.inf, shape=(90,), dtype=float),
+        "height_data": spaces.Box(-math.inf, math.inf, shape=(25, 25), dtype=float),
+        "nav_data": spaces.Box(-math.inf, math.inf, shape=(3, 33, 33), dtype=float)
     })
     """
     action_space = spaces.Box(-math.inf, math.inf, shape=(6, 4), dtype=float)
@@ -99,10 +76,10 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     # simulation
     decimation = 2
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 120, render_interval=decimation,
+        dt=1 / 60, render_interval=decimation,
         physx=PhysxCfg(
             #gpu_collision_stack_size = 2**27,
-            gpu_max_rigid_patch_count = 2**19
+            #gpu_max_rigid_patch_count = 2**19
         ),
         physics_material=RigidBodyMaterialCfg(
             static_friction=1.0,
@@ -111,8 +88,6 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     )
     # robot(s)
     robot: ArticulationCfg = SPIDER_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    #robot: ArticulationCfg = UNITREE_GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    #robot: ArticulationCfg = ANYMAL_C_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     
     # Spider Robot (base, leg_hip_i, leg_middle_i, leg_lower_i, leg_foot_i)
     base_name = "body"
@@ -122,6 +97,20 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     lower_leg_names = "leg_lower_.*"
     lower_leg_joint_names = "joint_leg_middle_leg_lower_.*"
     hip_joint_names = "joint_body_leg_hip_.*"
+
+    
+    player: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Player",
+        spawn=sim_utils.CapsuleCfg(
+            radius=0.25,
+            height=1.4,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)), # Make it red
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(max_angular_velocity=0, angular_damping=1000.0),
+            mass_props=sim_utils.MassPropertiesCfg(mass=70.0),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(2.0, 0.0, 0.75)),
+    )
 
     # Unitree Go2
     #base_name = "base"
@@ -145,17 +134,9 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
         track_air_time=True,
     )
 
-    height_scanner = RayCasterCfg(
-        prim_path=f"/World/envs/env_.*/Robot/{base_name}",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
-        ray_alignment="yaw",
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.5, 1.5]),  # type: ignore
-        debug_vis=False,
-        mesh_prim_paths=["/World/ground"],
-    )
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=int(1024*0.25/2),#0),
+        num_envs=int(1),#1024*0.25),#0),
         env_spacing=4.0, 
         replicate_physics=True
     )
@@ -163,7 +144,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
-        terrain_generator=SIMPLER_ROUGH_TERRAINS_CFG, # SIMPLER_ROUGH_TERRAINS_CFG,
+        terrain_generator=terrain_gen_cfg, # SIMPLER_ROUGH_TERRAINS_CFG,
         max_init_terrain_level=9,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -179,15 +160,40 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
     )
 
-    point_max_distance = 10 #20 #6.0
-    point_min_distance = 5 #10 #4.0
-    success_tolerance = 0.5 # 0.25  # meters
-    time_out_per_target = 10 #5.0  # seconds
-    time_out_decrease_per_target = 0.075  # seconds
-    base_on_ground_time = 1.0 #seconds before death if base is on ground
 
-    log_targets_reached_max = 10
-    log_targets_reached_step = 1
+    visualize_nav_data = True
+    lidar_scanner = RayCasterCfg(
+        prim_path=f"/World/envs/env_.*/Robot/{base_name}",
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.4)),
+        ray_alignment="base",
+        max_distance=50.0,
+        pattern_cfg=patterns.LidarPatternCfg(
+            horizontal_fov_range=(0, 360), # Full 360-degree sweep
+            vertical_fov_range=(-80, 40),  # Looks 40 deg up and 80 deg down
+            horizontal_res=5,              # 
+            channels=int((45+1+90)/2),     # ring every 2 deg vertically
+        ),
+        debug_vis=visualize_nav_data, 
+        mesh_prim_paths=["/World/ground"],
+    )
+    
+    base_on_ground_time = 0.5 #seconds before death if base is on ground
+
+    player_movement_angular_velocity = 0.5 # radians per second
+    player_movement_speed = 1.0 # m/s
+
+    patrol_size = 32.0 # Meters (Area the robot is expected to search)
+    staleness_res = 0.5 # Meters (Resolution of staleness map)
+    staleness_dim = int(patrol_size / staleness_res) # 96 pixels
+
+    nav_size = 32.0
+    nav_dim = 33 # must line up with model input size
+    nav_res = 1.0 # must be size / (dim - 1)
+
+    # Locomotion Height Map (CNN Input)
+    loco_size = 2.4
+    loco_dim = 25 # must line up with model input size
+    height_res = 0.1 # must be size / (dim - 1)
 
     marker_colors = 57
 
@@ -277,4 +283,35 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     feet_step_time_leeway = 2.0 # clamped out on positive  # ----- set to 0.8 # = set to 2.0
 
     joint_default_penalty = 0
+
+
+    # --- State Machine Settings ---
+    # 0: Patrol, 1: Investigate, 2: Look, 3: Attack, 4: Hide
+    num_states = 5
+
+    # State Thresholds
+    patrol_radius = 6.0 # How far patrol points spawn from origin
+    investigate_radius = 2.0 # How close to get to noise
+    attack_distance = 1.0 # How close to get to player
+    hide_distance = 8.0 # How far to run from player
+    
+    # Timers (in seconds)
+    look_duration = 2.0 # How long to stare before attacking
+    investigate_timeout = 10.0 
+    hide_duration = 5.0 
+
+    # Rewards (Behavioral)
+    # General
+    reward_shaping_scale = 1.0 
+    
+    # State Specific Reward Scales
+    patrol_reward_scale = 1.0
+    investigate_reward_scale = 2.0
+    look_reward_scale = 0.5
+    attack_reward_scale = 3.0
+    hide_reward_scale = 2.0
+    
+    # Specific component scales
+    los_reward_scale = 1.0 # Reward for keeping player in view (Look/Attack)
+    stealth_penalty_scale = -1.0 # Penalty for foot impact noise (Hide)
 

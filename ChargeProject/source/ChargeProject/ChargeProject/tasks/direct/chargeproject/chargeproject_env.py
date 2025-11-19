@@ -2,18 +2,19 @@ from __future__ import annotations
 import math
 import colorsys
 from time import time
+from enum import IntEnum
 
 import gymnasium as gym
 import torch
-import torch.compiler
 from collections.abc import Sequence
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation
+from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers
-from isaaclab.sensors import ContactSensor, RayCaster
+from isaaclab.sensors import ContactSensor, RayCaster, RayCasterCfg, patterns
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from .map_manager import MapManager
 from .spider_robot import SPIDER_JOINT_INFO
 
 from .chargeproject_env_cfg import ChargeprojectEnvCfg
@@ -26,6 +27,80 @@ import inspect
 import os
 
 
+"""
+states: 
+    Patrol: Goes slowly between set patrol points
+        When in patrol mode the env has an area where the robot can patrol
+        There is a "safe" area where the AI should be
+            when within x distance of the boundary it will be given a target position of the closest non-warning point
+            when outside the safe area it will be penalized
+        Transitions:
+            Investigate: If hear loud noise go to investigate with location of noise
+            Look: If it sees the player
+    Investigate: Moves to a location to gather more information
+        Transitions:
+            Patrol: Time out on patrol
+            Look: If it sees the player
+    Look: If it sees the player for more than ~0.1 seconds, stop and look at them for a moment
+        A counter that adds up when player is in sight and subtracts when not
+            see goes up scaled by distance to player (closer = faster)
+        Note: not given player position so it encourages not moving
+        Transitions:
+            Patrol: If counter goes to -X
+            Attack: If counter goes to +X
+    Attack: Engages the target
+        Transitions:
+            Investigate: If loses sight of target for long enough
+            Hide: After hitting target
+    Hide: Seeks cover from the target
+        Transitions:
+            Attack: After hiding for a set time
+obs: 
+    robot/leg/height_data
+    One hot state encoding in obs
+    Flag for if player is in LOS
+    Target position (Player or investigation point) | i/a/h
+
+actions:
+    Joint position targets
+rewards:
+    General:
+        Leg efficiency (minimize torque, accel, vel, action rate)
+        z_vel_error
+        ang_vel_error
+        undesired contacts
+        flat orientation
+    Patrol:
+        Velocity matching target patrol speed
+        Moving towards next patrol point
+        Penalize being outside safe area
+    Investigate:
+        Moving towards investigation point
+        Penalize being outside safe area
+        Reward for reaching investigation point
+    Look:
+        Reward for in LOS
+        Penalize feet movement
+    Attack:
+        Reward for in LOS
+        Reward for approaching player
+        Reward for force of contact with player
+        Flat Reward for impact
+    Hide:
+        Reward for staying out of sight
+        Penalize movement while hiding
+        Penalize contact force between feet and ground (to encourage quiet movement)
+"""
+
+# Enum for robot states
+class RobotState(IntEnum):
+    PATROL = 0
+    INVESTIGATE = 1
+    LOOK = 2
+    ATTACK = 3
+    HIDE = 4
+
+
 class ChargeprojectEnv(DirectRLEnv):
     cfg: ChargeprojectEnvCfg
 
@@ -33,13 +108,9 @@ class ChargeprojectEnv(DirectRLEnv):
         self, cfg: ChargeprojectEnvCfg, render_mode: str | None = None, **kwargs
     ):
         super().__init__(cfg, render_mode, **kwargs)
-        
-        # Target positions
-        self._desired_pos = torch.zeros(self.num_envs, 2, device=self.device)
-        self._next_desired_pos = torch.zeros(self.num_envs, 2, device=self.device)
-        self._time_since_target = torch.zeros(self.num_envs, device=self.device)
-        self._targets_reached = torch.zeros(self.num_envs, device=self.device)
-        self._time_outs = torch.zeros(self.num_envs, device=self.device)
+
+        # Player
+        self._player_movement_angle = torch.zeros(self.num_envs, device=self.device)
 
         # num_envs, 6, 4
         self._actions = torch.zeros(
@@ -92,8 +163,16 @@ class ChargeprojectEnv(DirectRLEnv):
         self.feet_step_up_counters = self.cfg.feet_step_time_leeway * torch.ones(self.num_envs, len(self.feet_body_ids), device=self.device)
         self.feet_step_down_counters = self.cfg.feet_step_time_leeway * torch.ones(self.num_envs, len(self.feet_body_ids), device=self.device)
 
-        # Change to initialize with nulls
-        self._distance_buffer = torch.zeros(self.num_envs, self.cfg.distance_lookback, device=self.device)
+        # State of robot (patrol, attack, hide, search)
+        self.robot_state = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+
+        # Different for each state
+        self.state_timers = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        # For storing data like last known player position or investigation point
+        self.nav_targets = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        self._up_dir = torch.tensor([0.0, 0.0, 1.0], device=self.device)
 
         log_dir = self.cfg.log_dir
         os.makedirs(log_dir, exist_ok=True)
@@ -117,10 +196,14 @@ class ChargeprojectEnv(DirectRLEnv):
         self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         self.scene.sensors["contact_sensor"] = self._contact_sensor
 
-        # we add a height scanner for perceptive locomotion
-        self._height_scanner = RayCaster(self.cfg.height_scanner)
-        self.scene.sensors["height_scanner"] = self._height_scanner
+        self._player = RigidObject(self.cfg.player)
         
+        self.scene.rigid_objects["player"] = self._player
+
+        # we add a height scanner for perceptive locomotion
+        self._lidar_sensor = RayCaster(self.cfg.lidar_scanner)
+        self.scene.sensors["lidar_scanner"] = self._lidar_sensor
+
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
@@ -130,13 +213,6 @@ class ChargeprojectEnv(DirectRLEnv):
             self.cfg.cameras = True
             print("No camera setting found in cfg, defaulting to cameras=True")
 
-        if self.cfg.cameras:
-            self.goal_pos_visualizer = self._create_sphere_markers(
-                self.cfg.marker_colors, 0.25, "/Visuals/Command/goal_position"
-            )
-            self.identifier_visualizer = self._create_arrow_markers(
-                self.cfg.marker_colors, "/Visuals/Command/identifier_arrow"
-            )
 
         # add ground plane
         # spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
@@ -151,106 +227,72 @@ class ChargeprojectEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-        self._up_dir = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+        terrain_gen = self.cfg.terrain.terrain_generator
+        terrain_dims = (terrain_gen.num_rows * terrain_gen.size[0], terrain_gen.num_cols * terrain_gen.size[1])
+        terrain_dims = (terrain_dims[0] + 2 * terrain_gen.border_width,
+                        terrain_dims[1] + 2 * terrain_gen.border_width)
+        self.map_manager = MapManager(self.cfg, self._terrain.env_origins, terrain_dims, self.device)
+
+        if self.cfg.cameras and self.cfg.visualize_nav_data:
+            self.identifier_visualizer = self._create_arrow_markers(
+                self.cfg.marker_colors, "/Visuals/Command/identifier_arrow"
+            )
+            self._create_debug_visualizers()
+
+            self.loco_height_data = None
+            self.nav_map_data = None
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self._actions = actions.clone()
         
-        target_distance = torch.linalg.norm(self._desired_pos - self._robot.data.root_pos_w[:, :2], dim=1)
-
-        if self.cfg.cameras:
-            self._visualize_markers(target_distance)
+        self._update_player_movement()
+        
+        if self.cfg.cameras and self.cfg.visualize_nav_data:
+            # Get data from MapManager
+            # (Assuming you have robot_pos, robot_yaw, and lidar_hits)
+            nav_map, loco_map = self.map_manager.update(
+                self._robot.data.root_pos_w,
+                self._robot.data.heading_w.unsqueeze(-1), # Assuming you have this
+                self._lidar_sensor.data.ray_hits_w # Assuming you have this
+            )
+            
+            # Store for visualization
+            self.nav_map_data = nav_map
+            self.loco_height_data = loco_map
+            self._visualize_markers()
 
         index = self._sim_step_counter % self.cfg.distance_lookback
-        
-        self._distance_buffer[:, index] = target_distance.squeeze(-1)
 
     def _apply_action(self) -> None:
         normalized_actions = self._actions.view(self._actions.shape[0], -1)
-        
+
         # For positive actions (0 to 1), scale by the positive range
         # For negative actions (-1 to 0), scale by the negative range
-        # torch.where is perfect for this: condition, value_if_true, value_if_false
         action_range = torch.where(normalized_actions > 0, self.positive_range, self.negative_range)
 
         # Calculate the final joint positions
         self.processed_actions = self.dof_default_pos + normalized_actions * action_range
-        
-        # Optional but recommended: Explicitly clip to ensure no floating point errors exceed limits
-        self.processed_actions = torch.clamp(self.processed_actions, self.dof_min_limits, self.dof_max_limits)
 
-        
-
-        """
-        hip_joint = self.dof_idx.index(self._robot.find_joints("joint_body_leg_hip_1")[0][0])
-        upper_joint = self.dof_idx.index(self._robot.find_joints("joint_leg_hip_leg_upper_1")[0][0])
-        middle_joint = self.dof_idx.index(self._robot.find_joints("joint_leg_upper_leg_middle_1")[0][0])
-        lower_joint = self.dof_idx.index(self._robot.find_joints("joint_leg_middle_leg_lower_1")[0][0])
-        
-        if self.common_step_counter <= 125:
-            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
-            # move the hip joint back
-            self.processed_actions[:, upper_joint] += 3
-        else:#elif self.common_step_counter <= 200:
-            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
-            # Slam the leg down
-            self.processed_actions[:, upper_joint] -= 3
-            
-        lower_joint_ids = self._robot.find_joints("joint_leg_middle_leg_lower_.*")[0]
-        # For testing standing on 3 legs
-        if self.common_step_counter % 500 <= 100:
-            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
-            self.processed_actions[:, lower_joint_ids] -= 1
-            #even_joints = self._robot.find_joints(".*0.*|.*2.*|.*4.*")[0]
-            #even_joints = [j for j in even_joints if j in self.dof_idx]
-            #self.processed_actions[:, even_joints] = 0
-        elif self.common_step_counter % 500 <= 200:
-            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
-        elif self.common_step_counter % 500 <= 300:
-            self.processed_actions = 0
-        elif self.common_step_counter % 500 <= 400:
-            self.processed_actions = -self._robot.data.default_joint_pos[:, self.dof_idx]
-        else:
-            self.processed_actions = -self._robot.data.default_joint_pos[:, self.dof_idx]
-            self.processed_actions[:, lower_joint_ids] += 1
-        """
-        # print the actions of the first env
-        #if self._sim_step_counter % 2 == 0:
-        #    print(self.processed_actions[0].shape, self.processed_actions[0])
         self._robot.set_joint_position_target(self.processed_actions, joint_ids=self.dof_idx)
-        # self.robot.set_joint_velocity_target(self.actions, joint_ids=self.dof_idx)
     
-    def _get_relative_target_info(
-        self, target_pos_w: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        relative_target_pos_w = target_pos_w - self._robot.data.root_pos_w[:, :2]
-        distance = torch.linalg.norm(relative_target_pos_w, dim=1, keepdim=True)
+    def _can_see_player(self, player_pos_w: torch.Tensor) -> torch.Tensor:
+        # Casts a ray from the robot to the player to check for line of sight
+        ray_origins = self._robot.data.root_pos_w + self._up_dir * self.cfg.player_view_height_offset
+        ray_directions = player_pos_w - ray_origins
+        ray_directions_norm = torch.linalg.norm(ray_directions, dim=1, keepdim=True)
+        ray_directions_unit = ray_directions / (ray_directions_norm + 1e-6)
 
-        # Pad the 2D world vector to 3D for rotation (z=0)
-        relative_target_pos_w_3d = torch.cat(
-            (relative_target_pos_w, torch.zeros_like(distance)), dim=1
-        )
+        # Check for intersections with the environment
+        hit_info = self.scene.ray_cast(ray_origins, ray_directions_unit)
 
-        # Rotate the world vector into the robot's local body frame
-        relative_target_pos_b_3d = math_utils.quat_apply_inverse(
-            self._robot.data.root_quat_w, relative_target_pos_w_3d
-        )
+        # Determine visibility based on raycast results
+        can_see = hit_info["hit"] & (hit_info["distance"] < self.cfg.player_view_distance)
+        return can_see
 
-        # Normalize the resulting 2D body-frame vector to get the unit vector
-        unit_vector_b = relative_target_pos_b_3d[:, :2] / (distance + 1e-6)
 
-        return unit_vector_b, distance
-    
-    #@torch.compile(mode="reduce-overhead")
-    def _get_observations_impl(self, height_scanner_data) -> dict:
-        target_unit_vector, target_distance = self._get_relative_target_info(
-            self._desired_pos
-        )
-
-        next_target_unit_vector, next_target_distance = self._get_relative_target_info(
-            self._next_desired_pos
-        )
-
+    def _get_observations(self) -> dict:
+        self._previous_actions = self._actions.clone()
+        
         net_contact_forces = self._contact_sensor.data.net_forces_w_history
         self.is_contact = (
             torch.max(
@@ -262,115 +304,67 @@ class ChargeprojectEnv(DirectRLEnv):
             > 1.0
         )
         
-        height_data = (
-            height_scanner_data.pos_w[:, 2].unsqueeze(1) - height_scanner_data.ray_hits_w[..., 2] - 0.5
-        ).clip(-1.0, 1.0)
 
-        # turn height data into a (16, 16) grid
-        height_data = height_data.view(self.num_envs, 16, 16)
-        
         # Concatenate the selected observations into a single tensor.
         obs = torch.cat(
             [
+                # Robot state
+                # Base info
                 self._robot.data.root_lin_vel_b,
                 self._robot.data.root_ang_vel_b,
                 self._robot.data.projected_gravity_b,
-                target_unit_vector,
-                target_distance,
-                next_target_unit_vector,
-                next_target_distance,
+                # Joint info
                 self._robot.data.joint_pos[:, self.dof_idx] - self._robot.data.default_joint_pos[:, self.dof_idx],
                 self._robot.data.joint_vel[:, self.dof_idx],
                 self._actions,
+                self.is_contact[:, self.feet_contact_ids].float(),
+
+                # Player relative position
+                self._player.data.root_pos_w - self._robot.data.root_pos_w,
             ],
             dim=-1,
         )
-        return {
+
+        nav_data, height_data = self.map_manager.update(
+            self._robot.data.root_pos_w,
+            self._robot.data.heading_w.unsqueeze(-1),
+            self._lidar_sensor.data.ray_hits_w,
+        )
+
+        observations = {
             "observations": obs,
-            "height_data": height_data
+            "height_data": height_data.view(self.num_envs, self.cfg.loco_dim, self.cfg.loco_dim),
+            "nav_data": nav_data,
         }
-
-        """
-        base_quat_w = self._robot.data.root_quat_w
-
-        quat_expanded = base_quat_w[:, None, :].expand(-1, len(self.feet_body_ids), -1)
-        feet_pos = self._robot.data.body_pos_w[:, self.feet_body_ids] - (self._robot.data.root_pos_w).unsqueeze(1)
-        foot_vectors_rotated = math_utils.quat_apply(quat_expanded, feet_pos)
-        # Concatenate the selected observations into a single tensor.
-        base_obs = torch.cat(
-            [
-                self._robot.data.root_lin_vel_b,
-                self._robot.data.root_ang_vel_b,
-                self._robot.data.projected_gravity_b,
-                foot_vectors_rotated.view(self.num_envs, -1),
-                target_unit_vector,
-                target_distance,
-                next_target_unit_vector,
-                next_target_distance,
-            ],
-            dim=-1,
-        )
-        # Concatenate the selected observations into a single tensor.
-        
-        # hip positions (vec in direction)
-        leg_obs = []
-        for i in range(self.action_space.shape[1]):
-            # rotate position vectors
-            hip_pos = self._robot.data.body_pos_w[:, self.hip_body_ids[i]] - self._robot.data.root_pos_w
-            hip_vec_rotated = math_utils.quat_apply(base_quat_w, hip_pos)
-            cycled_ids = self.feet_body_ids[i:] + self.feet_body_ids[:i] # Cycle so current leg is first
-            feet_pos = self._robot.data.body_pos_w[:, cycled_ids] - (self._robot.data.root_pos_w).unsqueeze(1)
-            foot_vec_rotated = math_utils.quat_apply(quat_expanded, feet_pos)
-            # offset all feet by current leg foot position (and remove current position because it's zero)
-            foot_vec_rotated = foot_vec_rotated - foot_vec_rotated[:, 0:1, :]
-            foot_vec_rotated = foot_vec_rotated[:, 1:, :]  # remove the zero vector for current foot
-
-            leg_obs.append(torch.cat(
-                [
-                self._robot.data.joint_pos[:, self.leg_joint_ids[i]] - self._robot.data.default_joint_pos[:, self.leg_joint_ids[i]],
-                self._robot.data.joint_vel[:, self.leg_joint_ids[i]],
-                hip_vec_rotated, # hip position vector
-                foot_vec_rotated.view(self.num_envs, -1), # relative foot positions of all feet
-                self.actions[:, i],
-                self.is_contact[:, self.feet_contact_ids[i]].float().unsqueeze(-1),
-                self._contact_sensor.data.current_contact_time[:, self.feet_contact_ids[i]].float().unsqueeze(-1),
-                self._contact_sensor.data.current_air_time[:, self.feet_contact_ids[i]].float().unsqueeze(-1),
-                ],
-                dim=-1,
-            ))
-        leg_obs = torch.stack(leg_obs, dim=1)
-
-        return {
-            "base_obs": base_obs,
-            "leg_obs": leg_obs,
-            "height_data": height_data
-        }
-        """
-
-    def _get_observations(self) -> dict:
-        self._previous_actions = self._actions.clone()
-
-        height_scanner_data = self._height_scanner.data
-
-        observations = self._get_observations_impl(height_scanner_data)
         # Need to clone because of torch.compile
         observations = {"policy": observations}# for rl_games, "critic": observations.clone()}
         return observations
 
-   #@torch.compile(mode="reduce-overhead")    
-    def _get_rewards_impl(self, reached_target_ids) -> torch.Tensor:
-        target_unit_vector, target_distance = self._get_relative_target_info(self._desired_pos)
+
+    def _get_rewards(self) -> torch.Tensor:
+
+        # Check if distance is within tolerance
+        #target_distance = torch.linalg.norm(self._desired_pos - self._robot.data.root_pos_w[:, :2], dim=1)
+        #reached_target = target_distance.squeeze(-1) < self.cfg.success_tolerance
+        #reached_target_ids = reached_target.nonzero(as_tuple=False).squeeze(-1)
+
+        # Generate a new target immediately for the environments that reached theirs
+        #if len(reached_target_ids) > 0:
+        #    self._move_next_targets(reached_target_ids)
+
+        
+        #target_unit_vector, target_distance = self._get_relative_target_info(self._desired_pos)
 
         # - Rewards -
         # Reward for progress towards the target
-        sum_valid = torch.nansum(self._distance_buffer, dim=1)
-        count_valid = torch.clamp(torch.sum(~torch.isnan(self._distance_buffer), dim=1), min=1.0)
-        previous_buffered_distance = sum_valid / count_valid
-        difference = (previous_buffered_distance - target_distance.squeeze(-1)) * (1 + 0.5 * (count_valid-1))
-        if self.cfg.progress_pow != 1.0: 
-            progress_reward = torch.sign(difference) * torch.pow(torch.abs(difference), self.cfg.progress_pow)
-        else:
-            progress_reward = difference
+        #sum_valid = torch.nansum(self._distance_buffer, dim=1)
+        #count_valid = torch.clamp(torch.sum(~torch.isnan(self._distance_buffer), dim=1), min=1.0)
+        #previous_buffered_distance = sum_valid / count_valid
+        #difference = (previous_buffered_distance - target_distance.squeeze(-1)) * (1 + 0.5 * (count_valid-1))
+        #if self.cfg.progress_pow != 1.0: 
+        #    progress_reward = torch.sign(difference) * torch.pow(torch.abs(difference), self.cfg.progress_pow)
+        #else:
+        #    progress_reward = difference
         #progress_reward = difference
         #progress_reward *= torch.log1p(self._targets_reached/2) + 1
 
@@ -379,13 +373,13 @@ class ChargeprojectEnv(DirectRLEnv):
 
         
         # Velocity alignment the target
-        velocity_alignment_reward = torch.nn.functional.cosine_similarity(
-           self._robot.data.root_lin_vel_w[:, :2], target_unit_vector, dim=1
-        )
+        #velocity_alignment_reward = torch.nn.functional.cosine_similarity(
+        #   self._robot.data.root_lin_vel_w[:, :2], target_unit_vector, dim=1
+        #)
 
         # Bonus for getting to target
         target_reward = torch.zeros(self.num_envs, device=self.device)
-        target_reward[reached_target_ids] = torch.log1p(self._targets_reached[reached_target_ids]) + 1
+        #target_reward[reached_target_ids] = torch.log1p(self._targets_reached[reached_target_ids]) + 1
 
 
         # died if gravity is near positive (flipped over)
@@ -545,9 +539,9 @@ class ChargeprojectEnv(DirectRLEnv):
         joint_default_penalty = torch.mean(torch.square(joint_deviation), dim=1)
 
 
-        return {
-            "progress_reward": progress_reward * self.cfg.progress_reward_scale * self.step_dt,
-            "velocity_alignment_reward": velocity_alignment_reward * self.cfg.velocity_alignment_reward_scale * self.step_dt,
+        rewards = {
+            #"progress_reward": progress_reward * self.cfg.progress_reward_scale * self.step_dt,
+            #"velocity_alignment_reward": velocity_alignment_reward * self.cfg.velocity_alignment_reward_scale * self.step_dt,
             "reach_target_reward": target_reward * self.cfg.reach_target_reward_scale * self.step_dt,
             "death_penalty": death_penalty * self.cfg.death_penalty_scale * self.step_dt,
             "movement_reward": movement_reward * self.cfg.movement_reward_scale * self.step_dt,
@@ -575,23 +569,9 @@ class ChargeprojectEnv(DirectRLEnv):
             "joint_default_penalty": joint_default_penalty * self.cfg.joint_default_penalty * self.step_dt,
         }
 
-
-    def _get_rewards(self) -> torch.Tensor:
-
-        # Check if distance is within tolerance
-        target_distance = torch.linalg.norm(self._desired_pos - self._robot.data.root_pos_w[:, :2], dim=1)
-        reached_target = target_distance.squeeze(-1) < self.cfg.success_tolerance
-        reached_target_ids = reached_target.nonzero(as_tuple=False).squeeze(-1)
-
-        # Generate a new target immediately for the environments that reached theirs
-        if len(reached_target_ids) > 0:
-            self._move_next_targets(reached_target_ids)
-
-        rewards = self._get_rewards_impl(reached_target_ids)
-
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
         
-
+        
         # Logging
         if self.cfg.log:
             self._log_data("Episode_Reward/total_reward", torch.mean(reward))
@@ -599,6 +579,7 @@ class ChargeprojectEnv(DirectRLEnv):
                 episodic_sum_avg = torch.mean(value)
                 self._log_data(f"Episode_Reward/{key}", episodic_sum_avg)
         
+            """
             # Add the average and max amount of targets reached to log
             self._log_data(
                 "Episode_Info/targets_reached_avg",
@@ -613,15 +594,14 @@ class ChargeprojectEnv(DirectRLEnv):
 
             for _, (t, c) in enumerate(zip(thresholds, counts), start=1):
                 self._log_data(f"Episode_Info/targets_reached_{t}", c)
-
+            """
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         full_time_out = self.episode_length_buf >= self.max_episode_length - 1
 
-        self._time_since_target += self.step_dt
-        timed_out = self._time_since_target > self._time_outs
-        # change it so seperate gtime_outs
+        timed_out = torch.zeros_like(full_time_out, dtype=torch.bool) #self._time_since_target > self._time_outs
+        # change it so seperate time_outs
         
         died = self._robot.data.projected_gravity_b[:, 2] > 0.0
         base_contact_time = self._contact_sensor.data.current_contact_time[:, self.base_body_ids].squeeze(-1)
@@ -668,67 +648,45 @@ class ChargeprojectEnv(DirectRLEnv):
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
-        self._last_targets_reached[env_ids] = self._targets_reached[env_ids].clone()
-
-        # Set Next target positions to be reset position
-        self._next_desired_pos[env_ids] = self._robot.data.root_pos_w[env_ids, :2].clone()
-        self._move_next_targets(env_ids)
-        self._move_next_targets(env_ids)  # call twice to initialize both current and next target positions
-        if len(env_ids) == self.num_envs:
+        # Reset the player's position
+        self._player.reset(env_ids)
+        player_pos = self._player.data.default_root_state[env_ids, :7]
+        player_pos[:, :3] += self._terrain.env_origins[env_ids]
+        self._player.write_root_pose_to_sim(player_pos, env_ids=env_ids)
+        self._player_movement_angle[env_ids] = torch.rand(len(env_ids), device=self.device) * 2 * math.pi
+        
+        #if len(env_ids) == self.num_envs:
             # For initial randomize the initial timeout
-            self._time_since_target[:] = (-self.cfg.time_out_per_target + 
-                torch.rand(self.num_envs, device=self.device) * self.cfg.time_out_per_target)
+            #self._time_since_target[:] = (-self.cfg.time_out_per_target + 
+            #    torch.rand(self.num_envs, device=self.device) * self.cfg.time_out_per_target)
 
-        self._time_outs[env_ids] = self.cfg.time_out_per_target
-        self._targets_reached[env_ids] = 0
 
     
     def _log_data(self, key, data) -> None:
         self.extras["log"][key] = data
 
-    def _reached_target(self, env_ids):
-        # Get robot and target positions (only x, y)
-        robot_pos = self._robot.data.root_pos_w[env_ids, :2]
-        target_pos = self._desired_pos[env_ids]
-        # Calculate distance
-        dist = torch.linalg.norm(robot_pos - target_pos, dim=1)
 
-        # Check if distance is within tolerance
-        return dist < self.cfg.success_tolerance
+    def _update_player_movement(self):
+        velocity = self._player.data.root_vel_w
 
-    def _move_next_targets(self, env_ids: Sequence[int]):
-        # Update current position
-        self._desired_pos[env_ids] = self._next_desired_pos[env_ids].clone()
+        # Update movement angle
+        self._player_movement_angle += self.cfg.player_movement_angular_velocity * self.step_dt
+        # Calculate new velocity components
+        velocity[:, 0] = self.cfg.player_movement_speed * torch.cos(self._player_movement_angle)
+        velocity[:, 1] = self.cfg.player_movement_speed * torch.sin(self._player_movement_angle)
+        # 0 out the z velocity
+        velocity[:, 2] = 0.0
 
-        num_resets = len(env_ids)
-
-        radius = self.cfg.point_max_distance
-        radius += (
-            self.cfg.point_min_distance - self.cfg.point_max_distance
-        ) * torch.rand(num_resets, device=self.device)
-        angle = 2 * math.pi * torch.rand(num_resets, device=self.device)
-        new_target_pos_xy = self._desired_pos[env_ids] + torch.stack(
-            [radius * torch.cos(angle), radius * torch.sin(angle)], dim=1
-        )
-
-        # Update current and next desired positions
-        self._next_desired_pos[env_ids] = new_target_pos_xy
-
-        # set _distance_buffer to nan and add current distance as element
-        self._distance_buffer[env_ids] = torch.nan
-        index = self._sim_step_counter % self.cfg.distance_lookback
-        distance = torch.linalg.norm(
-            self._robot.data.root_pos_w[env_ids, :2] - self._desired_pos[env_ids], dim=1
-        )
-        self._distance_buffer[env_ids, index] = distance
-
-        # Reset timer
-        self._time_since_target[env_ids] = 0.0
-        self._targets_reached[env_ids] += 1
-        self._time_outs[env_ids] = (
-            self.cfg.time_out_per_target
-            - self._targets_reached[env_ids] * self.cfg.time_out_decrease_per_target
-        )
+        # Move in a circle
+        # Write the target pose to the simulation
+        self._player.write_root_velocity_to_sim(velocity)
+        
+        # set the rotation to be straight up
+        position = self._player.data.root_pose_w
+        position[:, 3:6] = 0
+        position[:, 6] = 1
+        
+        self._player.write_root_pose_to_sim(position)
 
     def _get_random_colors(self, num_colors: int) -> list[tuple[float, float, float]]:
         colors = []
@@ -772,59 +730,175 @@ class ChargeprojectEnv(DirectRLEnv):
         marker_cfg = VisualizationMarkersCfg(prim_path=prim_path, markers=markers)
         return VisualizationMarkers(marker_cfg)
 
-    def _visualize_markers_impl(self, target_distance):
-        desired_pos_3d = torch.cat(
-            [
-                self._desired_pos,
-                0.2 * torch.ones((self.num_envs, 1), device=self.device),
-            ],
-            dim=-1,
-        )
-        marker_indices = (
-            torch.arange(self.num_envs, device=self.device) % self.cfg.marker_colors
-        )
 
-        # --- Identifier Arrow Marker ---
-        robot_pos_2d = self._robot.data.root_pos_w[:, :2]
-        relative_target_pos = self._desired_pos - robot_pos_2d
-        yaw = torch.atan2(relative_target_pos[:, 1], relative_target_pos[:, 0])
-        orientations = math_utils.quat_from_angle_axis(yaw, self._up_dir)
-
-        # Linearly interpolate scale from 0.15 down to 0 as the robot gets closer
-        # Clamp between 0.0 and 1.0 to handle cases where the robot is farther than max_dist
-        # The maximum distance should be `self.cfg.point_max_distance`
-        scale_factor = torch.clamp(
-            target_distance / self.cfg.point_max_distance, 0.0, 1.0
+    def _create_debug_visualizers(self):
+        # Height map visualizers
+        self.loco_pixel_size = self.cfg.loco_size / self.cfg.loco_dim
+        
+        loco_markers = {
+            "height": sim_utils.SphereCfg(
+                radius=self.loco_pixel_size * 5, # Sphere radius is half the pixel width
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), opacity=0.8),
+            )
+        }
+        loco_cfg = VisualizationMarkersCfg(
+            prim_path="/World/Debug/LocoHeightViz", 
+            markers=loco_markers,
         )
+        self.loco_height_viz = VisualizationMarkers(loco_cfg)
 
-        # Base scale for the arrow's width and height
-        arrow_thickness_scale = 0.15 * scale_factor.unsqueeze(1) + 0.05
-        # Make the arrow's length (x-axis) a bit longer for better visibility, relative to thickness
-        scales = torch.cat(
-            [2 * arrow_thickness_scale, arrow_thickness_scale, arrow_thickness_scale],
-            dim=1,
-        ).squeeze(-1)
-
-        arrow_positions = self._robot.data.root_pos_w + torch.tensor(
-            [0.0, 0.0, 0.5], device=self.device
+        # Loc map visualizers
+        self.nav_pixel_size = self.cfg.nav_size / self.cfg.nav_dim
+        
+        nav_markers = {
+            "staleness": sim_utils.CuboidCfg(
+                size=(1.0, 1.0, 1.0), # Default 1m height
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.2, 1.0), opacity=0.3),
+            ),
+            "density": sim_utils.CuboidCfg(
+                size=(1.0, 1.0, 1.0),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.2), opacity=0.3),
+            )
+        }
+        nav_cfg = VisualizationMarkersCfg(
+            prim_path="/World/Debug/NavMapViz", 
+            markers=nav_markers,
         )
+        self.nav_map_viz = VisualizationMarkers(nav_cfg)
 
-        return desired_pos_3d, marker_indices, arrow_positions, orientations, scales
+    def _get_egocentric_grid_points(self, dim, map_size, z_data, robot_pos, robot_quat):
+        pixel_size = map_size / dim
+        
+        # Create grid indices (e.g., -12 to +12 for 25 dim)
+        offset = (dim - 1) / 2.0
+        indices = torch.arange(dim, device=self.device)
+        
+        # Create local X, Y coordinates
+        # 'ij' indexing: y_grid is rows, x_grid is columns
+        y_grid, x_grid = torch.meshgrid(indices - offset, indices - offset, indexing='ij')
+        
+        # Scale to meters
+        x_local = x_grid * pixel_size
+        y_local = y_grid * pixel_size
+        
+        # Combine with Z data
+        local_points = torch.stack([x_local, y_local, z_data], dim=-1) # (Dim, Dim, 3)
+        
+        # Rotate and translate to world frame
+        # quat_apply expects (N, 3), so we view
+        local_points_flat = local_points.view(-1, 3)
+        world_points = math_utils.quat_apply_yaw(robot_quat, local_points_flat) + robot_pos
+        
+        return world_points.view(dim, dim, 3)
 
-    def _visualize_markers(self, target_distance):
-        (
-            desired_pos_3d,
-            marker_indices,
-            arrow_positions,
-            orientations,
-            scales,
-        ) = self._visualize_markers_impl(target_distance)
-        self.goal_pos_visualizer.visualize(
-            desired_pos_3d, marker_indices=marker_indices
+    def _visualize_markers(self):
+        # Skip if no data
+        if self.nav_map_data is None or self.loco_height_data is None:
+            return
+
+        env_id = 0
+        robot_pos = self._robot.data.root_pos_w[env_id]
+        robot_quat = self._robot.data.root_quat_w[env_id]
+
+        all_translations = []
+        all_scales = []
+        all_indices = []
+
+        # Height map visualizers
+        loco_data = self.loco_height_data[env_id, 0] # (25, 25)
+        
+        loco_points = self._get_egocentric_grid_points(
+            self.cfg.loco_dim, 
+            self.cfg.loco_size, 
+            loco_data, 
+            robot_pos, 
+            robot_quat
         )
-        self.identifier_visualizer.visualize(
-            translations=arrow_positions,
-            orientations=orientations,
-            scales=scales,
-            marker_indices=marker_indices,
+        
+        # All these markers are "height" (index 0)
+        num_loco_points = self.cfg.loco_dim ** 2
+        all_translations.append(loco_points.view(-1, 3))
+        all_indices.append(torch.full((num_loco_points,), 0, dtype=torch.int32, device=self.device))
+        
+        # Spheres have uniform scale
+        sphere_scale = torch.full((num_loco_points, 3), self.loco_pixel_size / 2.0, device=self.device)
+        all_scales.append(sphere_scale)
+
+        # Navigation map visualizers
+        stale_data = self.nav_map_data[env_id, 0]
+        density_data = self.nav_map_data[env_id, 1] * 0.25 # Scaling down density for viz
+        height_data = self.nav_map_data[env_id, 2] # Terrain Height relative to robot
+
+        num_nav_points = self.cfg.nav_dim ** 2
+
+        bar_width = self.nav_pixel_size / 8.0
+
+        # Clamp and scale heights so they are visible
+        stale_h = 0.5 * stale_data.clamp(min=0.01).view(-1, 1)
+        density_h = 0.5 * density_data.clamp(min=0.01).view(-1, 1)
+
+        scale_xy = torch.full((num_nav_points, 2), bar_width, device=self.device)
+        
+        stale_scales = torch.cat([scale_xy, stale_h], dim=1)
+        density_scales = torch.cat([scale_xy, density_h], dim=1)
+
+        # Put bar on top of terrain height
+        z_stale = height_data + (stale_h.view(self.cfg.nav_dim, self.cfg.nav_dim) / 2.0)
+        z_density = height_data + (density_h.view(self.cfg.nav_dim, self.cfg.nav_dim) / 2.0)
+
+        # Generate base grid points (Center of the cell, correct height)
+        stale_points = self._get_egocentric_grid_points(
+            self.cfg.nav_dim, self.cfg.nav_size, z_stale, robot_pos, robot_quat
+        ).view(-1, 3)
+        
+        density_points = self._get_egocentric_grid_points(
+            self.cfg.nav_dim, self.cfg.nav_size, z_density, robot_pos, robot_quat
+        ).view(-1, 3)
+
+        # Put bars side by side
+        offset_mag = bar_width / 1.5
+
+        zeros = torch.zeros(num_nav_points, device=self.device)
+        ones = torch.ones(num_nav_points, device=self.device)
+
+        offset_local_stale = torch.stack([zeros, ones * offset_mag, zeros], dim=1)   # Shift Left
+        offset_local_density = torch.stack([zeros, ones * -offset_mag, zeros], dim=1) # Shift Right
+
+        # Rotate offsets to World Frame to match robot orientation
+        quat_batch = robot_quat.repeat(num_nav_points, 1)
+        
+        offset_world_stale = math_utils.quat_apply_yaw(quat_batch, offset_local_stale)
+        offset_world_density = math_utils.quat_apply_yaw(quat_batch, offset_local_density)
+
+        # Apply offsets
+        stale_points += offset_world_stale
+        density_points += offset_world_density
+        
+        # Staleness (Index 1)
+        all_translations.append(stale_points)
+        all_scales.append(stale_scales)
+        all_indices.append(torch.full((num_nav_points,), 0, dtype=torch.int32, device=self.device))
+
+        # Density (Index 2)
+        all_translations.append(density_points)
+        all_scales.append(density_scales)
+        all_indices.append(torch.full((num_nav_points,), 1, dtype=torch.int32, device=self.device))
+        
+        # Draw Loco Map
+        self.loco_height_viz.visualize(
+            translations=all_translations[0],
+            scales=all_scales[0],
+            marker_indices=all_indices[0]
         )
+        
+        # Draw Nav Map
+        nav_translations = torch.cat([all_translations[1], all_translations[2]], dim=0)
+        nav_scales = torch.cat([all_scales[1], all_scales[2]], dim=0)
+        nav_indices = torch.cat([all_indices[1], all_indices[2]], dim=0)
+        
+        self.nav_map_viz.visualize(
+            translations=nav_translations,
+            scales=nav_scales,
+            marker_indices=nav_indices
+        )
+        
