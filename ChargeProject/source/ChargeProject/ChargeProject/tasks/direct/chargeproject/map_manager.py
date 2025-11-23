@@ -1,3 +1,4 @@
+from matplotlib import pyplot as plt
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -8,23 +9,38 @@ from isaaclab.utils.warp import convert_to_warp_mesh, raycast_mesh
 import isaaclab.sim as sim_utils
 
 class MapManager:
-    def __init__(self, config, env_origins, terrain_dims, device):
+    def __init__(self, config, num_envs, terrain_dims, device):
         self.device = device
-        self.num_envs = env_origins.shape[0]
-        self.env_origins = env_origins
+        self.num_envs = num_envs
         self.config = config
         
         # Global World Map (Shared Height)
         self.world_w = terrain_dims[0]
         self.world_h = terrain_dims[1]
 
+        # --- Generate Circular Patrol Mask ---
+        # Coordinates -1 to 1
+        x = torch.linspace(-1, 1, self.config.staleness_dim, device=device)
+        y = torch.linspace(-1, 1, self.config.staleness_dim, device=device)
+        grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
+        
+        # Distance from center (Normalized 0 to 1)
+        dist = torch.sqrt(grid_x**2 + grid_y**2)
+        
+        # Fade width: 15% of radius
+        fade_width = 0.15
+        
+        self.patrol_mask = torch.clamp((1.0 - dist) / fade_width, min=0.0, max=1.0)
+        
+        # Reshape to (1, 1, H, W) for broadcasting
+        self.patrol_mask = self.patrol_mask.view(1, 1, self.config.staleness_dim, self.config.staleness_dim)
+
         # --- Initialization ---
         ground_prim_path = "/World/ground"
-        # ... (Keep existing initialization code) ...
         self.global_height_map = self._scan_entire_world(ground_prim_path)
         
         # Initialize per-env staleness (1.0 = Stale/Dusty)
-        self.staleness_maps = torch.ones(self.num_envs, 1, self.config.staleness_dim, self.config.staleness_dim, device=device)
+        self.staleness_maps = self.patrol_mask.repeat(self.num_envs, 1, 1, 1).clone()
         
         # Pre-calculate 8 cardinal relative offsets (Radius = 12.0m)
         # Angles: 0 (Front), 45, 90 (Left), 135, 180 (Back), etc.
@@ -103,25 +119,25 @@ class MapManager:
         
         return height_map
 
-    def update(self, robot_pos_w, robot_yaw_w, lidar_hits_w):
-        # 1. Update Staleness & Calculate Reward (Amount Cleared)
-        cleared_value = self._update_staleness_map(lidar_hits_w)
+    def update(self, env_origins, robot_pos_w, robot_yaw_w, lidar_hits_w):
+        # Update Staleness & Calculate Reward (Amount Cleared)
+        cleared_value = self._update_staleness_map(lidar_hits_w, env_origins)
 
-        # 2. Sample Far Sensors (8 Cardinal Directions)
-        far_staleness = self._get_far_staleness(robot_pos_w, robot_yaw_w)
+        # Sample Far Sensors (8 Cardinal Directions)
+        far_staleness = self._get_far_staleness(robot_pos_w, robot_yaw_w, env_origins)
 
-        # 3. Generate Standard Observations
-        nav_map, loco_map = self._sample_egocentric_maps(robot_pos_w, robot_yaw_w, lidar_hits_w)
-        
+        # Generate Standard Observations
+        nav_map, loco_map = self._sample_egocentric_maps(robot_pos_w, robot_yaw_w, lidar_hits_w, env_origins)
+
         return nav_map, loco_map, far_staleness, cleared_value
 
-    def _update_staleness_map(self, lidar_hits_w):
+    def _update_staleness_map(self, lidar_hits_w, env_origins):
         # Decay (Everything gets dusty)
         self.staleness_maps += 0.01
-        self.staleness_maps.clamp_(max=1.0)
+        self.staleness_maps = torch.minimum(self.staleness_maps, self.patrol_mask)
         
         # Calculate hits relative to Env Origin
-        rel_hits = lidar_hits_w - self.env_origins.unsqueeze(1)
+        rel_hits = lidar_hits_w - env_origins.unsqueeze(1)
         
         # Map to Pixel Coordinates
         half_size = self.config.patrol_size / 2
@@ -164,32 +180,28 @@ class MapManager:
             
         return total_cleared_value
 
-    def _get_far_staleness(self, robot_pos_w, robot_yaw_w):
+    def _get_far_staleness(self, robot_pos_w, robot_yaw_w, env_origins):
         """Samples staleness at 8 cardinal directions rotated by robot yaw."""
         cos = torch.cos(robot_yaw_w).squeeze(-1)
         sin = torch.sin(robot_yaw_w).squeeze(-1)
         
-        # 1. Rotate offsets by Robot Yaw
-        # (N, 1, 2) * (1, 8, 2) broadcast is tricky, let's do manual rotation
-        # offsets: (8, 2) -> x, y
-        x_off = self.far_sensor_offsets[:, 0] # (8)
-        y_off = self.far_sensor_offsets[:, 1] # (8)
+        # Rotate offsets by Robot Yaw
+        x_off = self.far_sensor_offsets[:, 0]
+        y_off = self.far_sensor_offsets[:, 1] 
         
         # Rotated offsets (N, 8)
-        # x' = x cos - y sin
-        # y' = x sin + y cos
         rx = x_off.unsqueeze(0) * cos.unsqueeze(1) - y_off.unsqueeze(0) * sin.unsqueeze(1)
         ry = x_off.unsqueeze(0) * sin.unsqueeze(1) + y_off.unsqueeze(0) * cos.unsqueeze(1)
         
-        # 2. Add to Robot Position to get World Position
+        # Add to Robot Position to get World Position
         # (N, 1) + (N, 8)
         px = robot_pos_w[:, 0].unsqueeze(1) + rx
         py = robot_pos_w[:, 1].unsqueeze(1) + ry
         
-        # 3. Normalize to [-1, 1] grid coordinates relative to Patrol Box
+        # Normalize to [-1, 1] grid coordinates relative to Patrol Box
         # grid = (pos - env_origin) / (patrol_size/2)
-        rel_x = px - self.env_origins[:, 0].unsqueeze(1)
-        rel_y = py - self.env_origins[:, 1].unsqueeze(1)
+        rel_x = px - env_origins[:, 0].unsqueeze(1)
+        rel_y = py - env_origins[:, 1].unsqueeze(1)
         
         norm_x = rel_x / (self.config.patrol_size / 2.0)
         norm_y = rel_y / (self.config.patrol_size / 2.0)
@@ -197,17 +209,17 @@ class MapManager:
         # Stack for grid_sample: (N, 1, 8, 2) -> Treated as a "Line" image of width 8
         grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(1)
         
-        # 4. Sample
+        # Sample
         # Output: (N, 1, 1, 8)
         samples = F.grid_sample(self.staleness_maps, grid, align_corners=False, padding_mode='border')
         
         return samples.view(self.num_envs, 8)
 
-    def _sample_egocentric_maps(self, robot_pos_w, robot_yaw_w, lidar_hits_w):
+    def _sample_egocentric_maps(self, robot_pos_w, robot_yaw_w, lidar_hits_w, env_origins):
         cos = torch.cos(robot_yaw_w).squeeze(-1)
         sin = torch.sin(robot_yaw_w).squeeze(-1)
         
-        # --- A. Prepare Affine Data for Global Height Map ---
+        # --- Prepare Affine Data for Global Height Map ---
         # World Normals [-1, 1]
         tx = (robot_pos_w[:, 0]) / (self.world_w / 2)
         ty = (robot_pos_w[:, 1]) / (self.world_h / 2)
@@ -229,9 +241,9 @@ class MapManager:
         nav_height -= robot_z
         loco_height -= robot_z
 
-        # --- B. Prepare Affine Data for Local Staleness ---
+        # --- Prepare Affine Data for Local Staleness ---
         # Normals relative to Patrol Zone [-1, 1]
-        rel_pos = robot_pos_w - self.env_origins
+        rel_pos = robot_pos_w - env_origins
         tx_s = rel_pos[:, 0] / (self.config.patrol_size / 2)
         ty_s = rel_pos[:, 1] / (self.config.patrol_size / 2)
         
@@ -241,7 +253,7 @@ class MapManager:
         grid_s = F.affine_grid(theta_s, torch.Size((self.num_envs, 1, self.config.nav_dim, self.config.nav_dim)), align_corners=False)
         nav_staleness = F.grid_sample(self.staleness_maps, grid_s, align_corners=False, padding_mode='border')
         
-        # --- C. Generate Lidar Density (33x33) ---
+        # --- Generate Lidar Density (33x33) ---
         # This needs to be in the Robot Frame
         # Transform hits to robot frame (Rotate by -Yaw)
         diff = lidar_hits_w - robot_pos_w.unsqueeze(1)
@@ -277,3 +289,7 @@ class MapManager:
         theta[:, 1, 1] = scale * cos
         theta[:, 1, 2] = ty
         return theta
+    
+    def reset(self, env_ids):
+        # Reset specific environments
+        self.staleness_maps[env_ids] = 1.0

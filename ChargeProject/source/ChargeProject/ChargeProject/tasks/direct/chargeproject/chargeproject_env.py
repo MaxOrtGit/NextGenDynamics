@@ -5,6 +5,8 @@ from time import time
 from enum import IntEnum
 
 import gymnasium as gym
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from collections.abc import Sequence
 
@@ -16,6 +18,7 @@ from isaaclab.sensors import ContactSensor, RayCaster, RayCasterCfg, patterns
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from .map_manager import MapManager
 from .spider_robot import SPIDER_JOINT_INFO
+from .natural_terrain import SmoothTerrainCfg
 
 from .chargeproject_env_cfg import ChargeprojectEnvCfg
 
@@ -182,16 +185,18 @@ class ChargeprojectEnv(DirectRLEnv):
 
         self.extras["log"] = dict()
 
-        # Save the variables in ChargeprojectEnvCfg to a text file for reference
-        with open(os.path.join(log_dir, "env_config.txt"), "w") as f:
-            for attr, value in vars(self.cfg).items():
-                f.write(f"{attr}: {value}\n")
 
+        # Save env and config code for reproducibility
         current_file = inspect.getfile(inspect.currentframe())
         with open(os.path.join(log_dir, "env_code.py.txt"), "w") as f:
             with open(current_file, "r") as current_f:
                 f.write(current_f.read())
-        
+
+        config_file = self.cfg._get_config_file_path()
+        with open(os.path.join(log_dir, "env_config.py.txt"), "w") as f:
+            with open(config_file, "r") as config_f:
+                f.write(config_f.read())
+                
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -234,7 +239,8 @@ class ChargeprojectEnv(DirectRLEnv):
         terrain_dims = (terrain_gen.num_rows * terrain_gen.size[0], terrain_gen.num_cols * terrain_gen.size[1])
         terrain_dims = (terrain_dims[0] + 2 * terrain_gen.border_width,
                         terrain_dims[1] + 2 * terrain_gen.border_width)
-        self.map_manager = MapManager(self.cfg, self._terrain.env_origins, terrain_dims, self.device)
+        
+        self.map_manager = MapManager(self.cfg, self.num_envs, terrain_dims, self.device)
 
         if self.cfg.cameras and self.cfg.visualize_nav_data:
             self.identifier_visualizer = self._create_arrow_markers(
@@ -253,7 +259,8 @@ class ChargeprojectEnv(DirectRLEnv):
         if self.cfg.cameras and self.cfg.visualize_nav_data:
             # Get data from MapManager
             # (Assuming you have robot_pos, robot_yaw, and lidar_hits)
-            nav_map, loco_map = self.map_manager.update(
+            nav_map, loco_map, _, _ = self.map_manager.update(
+                self._get_origins(),
                 self._robot.data.root_pos_w,
                 self._robot.data.heading_w.unsqueeze(-1), # Assuming you have this
                 self._lidar_sensor.data.ray_hits_w # Assuming you have this
@@ -308,6 +315,7 @@ class ChargeprojectEnv(DirectRLEnv):
         
         
         nav_data, height_data, far_staleness, self.last_exploration_bonus = self.map_manager.update(
+            self._get_origins(),
             self._robot.data.root_pos_w,
             self._robot.data.heading_w.unsqueeze(-1),
             self._lidar_sensor.data.ray_hits_w,
@@ -348,7 +356,6 @@ class ChargeprojectEnv(DirectRLEnv):
 
 
     def _get_rewards(self) -> torch.Tensor:
-
         
         # Reward for moving (average of buffer is = to this)
         movement_reward = torch.linalg.norm(self._robot.data.root_lin_vel_b[:, :2], dim=1)
@@ -515,9 +522,22 @@ class ChargeprojectEnv(DirectRLEnv):
         # Mean squared deviation
         joint_default_penalty = torch.mean(torch.square(joint_deviation), dim=1)
 
+        # Patrol specific rewards
+        patrol_mask = (self.robot_state == RobotState.PATROL).float()
+        exploration_reward = self.last_exploration_bonus 
+        # Distance from env_origin
+        pos_w = self._robot.data.root_pos_w[:, :2]
+        origin = self._get_origins()[:, :2]
+        dist = torch.norm(pos_w - origin, dim=1)
+        
+        # Soft limit: Penalize (dist - radius)^2, but only if dist > radius
+        excess_dist = torch.clamp(dist - self.cfg.patrol_size, min=0.0)
+        boundary_penalty = torch.square(excess_dist)
 
         rewards = {
-            "exploration_reward": self.last_exploration_bonus * self.cfg.exploration_reward_scale * self.step_dt,
+            # Patrol specific rewards
+            "exploration_reward": patrol_mask * exploration_reward * self.cfg.exploration_reward_scale * self.step_dt,
+            "patrol_boundary_penalty": patrol_mask * boundary_penalty * self.cfg.patrol_boundary_penalty_scale * self.step_dt,
             "reach_target_reward": target_reward * self.cfg.reach_target_reward_scale * self.step_dt,
             "death_penalty": death_penalty * self.cfg.death_penalty_scale * self.step_dt,
             "movement_reward": movement_reward * self.cfg.movement_reward_scale * self.step_dt,
@@ -614,12 +634,14 @@ class ChargeprojectEnv(DirectRLEnv):
         # Sample new commands
         # self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.0, 1.0)
 
+
+        origins = self._get_origins()[env_ids]
         # Reset
         joint_pos = self._robot.data.default_joint_pos[env_ids]
         joint_vel = self._robot.data.default_joint_vel[env_ids]
         default_root_state = self._robot.data.default_root_state[env_ids]
         #default_root_state[:, :3] += self.scene.env_origins[env_ids]
-        default_root_state[:, :3] += self._terrain.env_origins[env_ids]
+        default_root_state[:, :3] += origins
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
@@ -627,17 +649,24 @@ class ChargeprojectEnv(DirectRLEnv):
         # Reset the player's position
         self._player.reset(env_ids)
         player_pos = self._player.data.default_root_state[env_ids, :7]
-        player_pos[:, :3] += self._terrain.env_origins[env_ids]
+        player_pos[:, :3] += origins
         self._player.write_root_pose_to_sim(player_pos, env_ids=env_ids)
         self._player_movement_angle[env_ids] = torch.rand(len(env_ids), device=self.device) * 2 * math.pi
+
+        # Reset MapManager data
+        self.map_manager.reset(env_ids)
         
         #if len(env_ids) == self.num_envs:
             # For initial randomize the initial timeout
             #self._time_since_target[:] = (-self.cfg.time_out_per_target + 
             #    torch.rand(self.num_envs, device=self.device) * self.cfg.time_out_per_target)
 
+    def _get_origins(self) -> torch.Tensor:
+        spawn_points = SmoothTerrainCfg.spawns_positions
+        loops = np.ceil(self.num_envs / spawn_points.shape[0])
+        terrain_offsets = spawn_points.repeat(int(loops), 1)[: self.num_envs]
+        return self._terrain.env_origins + terrain_offsets
 
-    
     def _log_data(self, key, data) -> None:
         self.extras["log"][key] = data
 
@@ -877,3 +906,41 @@ class ChargeprojectEnv(DirectRLEnv):
             scales=nav_scales,
             marker_indices=nav_indices
         )
+
+        # Extract data and convert to numpy (CPU)
+        env_id = 0
+        
+        loco_map = self.loco_height_data[env_id, 0].detach().cpu().float().numpy()
+        stale_map = self.nav_map_data[env_id, 0].detach().cpu().float().numpy()
+        density_map = self.nav_map_data[env_id, 1].detach().cpu().float().numpy()
+        height_map = self.nav_map_data[env_id, 2].detach().cpu().float().numpy()
+
+        # Lazy initialization of the figure (runs only once)
+        if not hasattr(self, '_viz_fig'):
+            plt.ion() # Interactive mode on
+            self._viz_fig, self._viz_axs = plt.subplots(1, 4, figsize=(15, 4))
+            self._viz_im_refs = [None, None, None, None]
+            
+            titles = ["Loco Height", "Nav Staleness", "Nav Density", "Nav Height"]
+            for ax, title in zip(self._viz_axs, titles):
+                ax.set_title(title)
+                ax.axis('off') # Hide axis numbers for cleaner look
+
+        # Update the images
+        maps = [loco_map, stale_map, density_map, height_map]
+        
+        for i, data in enumerate(maps):
+            if self._viz_im_refs[i] is None:
+                # First time render
+                # origin='lower' puts (0,0) at bottom-left (standard for grid maps)
+                self._viz_im_refs[i] = self._viz_axs[i].imshow(data, origin='lower', cmap='viridis')
+                self._viz_fig.colorbar(self._viz_im_refs[i], ax=self._viz_axs[i], fraction=0.046, pad=0.04)
+            else:
+                # Fast update
+                self._viz_im_refs[i].set_data(data)
+                # Auto-scale colors to min/max of current data
+                self._viz_im_refs[i].set_clim(data.min(), data.max())
+
+        # Refresh plot without blocking
+        plt.draw()
+        plt.pause(0.001)

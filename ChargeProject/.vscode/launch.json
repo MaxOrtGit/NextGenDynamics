@@ -42,8 +42,8 @@
             "name": "Python: Train Environment",
             "type": "python",
             "request": "launch",
-            "args" : ["--task", "Chargeproject-Direct-v0", "--headless",
-                      "--video", "--video_interval", "250", "--video_length", "250", // "--rendering_mode", "performance",
+            "args" : ["--task", "Chargeproject-Direct-v0",// "--headless",
+                      //"--video", "--video_interval", "250", "--video_length", "250", // "--rendering_mode", "performance",
                       //"--checkpoint", "checkpoints/Spider/agent_126500.pt"
                     ],
             "program": "${workspaceFolder}/scripts/skrlcustom/train.py",

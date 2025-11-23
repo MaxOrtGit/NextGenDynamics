@@ -187,7 +187,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env_cfg.log_dir = log_dir
-    env_cfg.cameras = args_cli.enable_cameras
+    env_cfg.cameras = args_cli.enable_cameras or not args_cli.headless
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     # convert to single-agent instance if required by the RL algorithm

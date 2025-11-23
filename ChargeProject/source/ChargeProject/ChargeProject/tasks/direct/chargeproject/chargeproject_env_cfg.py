@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import inspect
 import math
 from requests import patch
 from sympy import prime
@@ -50,6 +51,9 @@ SIMPLER_ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
 
 @configclass
 class ChargeprojectEnvCfg(DirectRLEnvCfg):
+
+    def _get_config_file_path(self) -> str:
+        return inspect.getfile(inspect.currentframe())
 
     #always should be on
     log = True
@@ -102,8 +106,8 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     player: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Player",
         spawn=sim_utils.CapsuleCfg(
-            radius=0.25,
-            height=1.4,
+            radius=0.025,
+            height=0.14,
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)), # Make it red
             rigid_props=sim_utils.RigidBodyPropertiesCfg(max_angular_velocity=0, angular_damping=1000.0),
             mass_props=sim_utils.MassPropertiesCfg(mass=70.0),
@@ -136,7 +140,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=int(1024*0.5),#0),
+        num_envs=int(1),#0),
         env_spacing=4.0, 
         replicate_physics=True
     )
@@ -161,7 +165,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     )
 
 
-    visualize_nav_data = False
+    visualize_nav_data = True
     lidar_scanner = RayCasterCfg(
         prim_path=f"/World/envs/env_.*/Robot/{base_name}",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.4)),
@@ -184,11 +188,11 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
 
     patrol_size = 32.0 # Meters (Area the robot is expected to search)
     staleness_res = 0.5 # Meters (Resolution of staleness map)
-    staleness_dim = int(patrol_size / staleness_res) # 96 pixels
+    staleness_dim = int(patrol_size / staleness_res) # 64 pixels
 
-    nav_size = 32.0
+    nav_size = 24.0
     nav_dim = 33 # must line up with model input size
-    nav_res = 1.0 # must be size / (dim - 1)
+    nav_res = 0.75 # must be size / (dim - 1)
 
     # Locomotion Height Map (CNN Input)
     loco_size = 2.4
@@ -236,6 +240,8 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
 
     # --- Reward Scales ---
     exploration_reward_scale = 0.5
+    
+    patrol_boundary_penalty_scale = -10.0
 
     # Multiplied by targets hit reward
     reach_target_reward_scale = 1000 * 4 # == add * 4
@@ -287,30 +293,3 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     # --- State Machine Settings ---
     # 0: Patrol, 1: Investigate, 2: Look, 3: Attack, 4: Hide
     num_states = 5
-
-    # State Thresholds
-    patrol_radius = 6.0 # How far patrol points spawn from origin
-    investigate_radius = 2.0 # How close to get to noise
-    attack_distance = 1.0 # How close to get to player
-    hide_distance = 8.0 # How far to run from player
-    
-    # Timers (in seconds)
-    look_duration = 2.0 # How long to stare before attacking
-    investigate_timeout = 10.0 
-    hide_duration = 5.0 
-
-    # Rewards (Behavioral)
-    # General
-    reward_shaping_scale = 1.0 
-    
-    # State Specific Reward Scales
-    patrol_reward_scale = 1.0
-    investigate_reward_scale = 2.0
-    look_reward_scale = 0.5
-    attack_reward_scale = 3.0
-    hide_reward_scale = 2.0
-    
-    # Specific component scales
-    los_reward_scale = 1.0 # Reward for keeping player in view (Look/Attack)
-    stealth_penalty_scale = -1.0 # Penalty for foot impact noise (Hide)
-
