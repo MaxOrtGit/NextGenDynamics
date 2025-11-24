@@ -63,7 +63,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     # - spaces definition
     action_space = 24
     observation_space = spaces.Dict({
-        "observations": spaces.Box(-math.inf, math.inf, shape=(98,), dtype=float),
+        "observations": spaces.Box(-math.inf, math.inf, shape=(98 - 3,), dtype=float),
         "height_data": spaces.Box(-math.inf, math.inf, shape=(25, 25), dtype=float),
         "nav_data": spaces.Box(-math.inf, math.inf, shape=(3, 33, 33), dtype=float)
     })
@@ -78,12 +78,12 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     state_space = 0 #idk why this is here
 
     # simulation
-    decimation = 2
+    decimation = 1
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 60, render_interval=decimation,
         physx=PhysxCfg(
-            #gpu_collision_stack_size = 2**27,
-            #gpu_max_rigid_patch_count = 2**19
+            gpu_collision_stack_size = 2**29,
+            gpu_max_rigid_patch_count = 2**19
         ),
         physics_material=RigidBodyMaterialCfg(
             static_friction=1.0,
@@ -140,7 +140,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=int(1),#0),
+        num_envs=int(1024*4),#0),
         env_spacing=4.0, 
         replicate_physics=True
     )
@@ -165,7 +165,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     )
 
 
-    visualize_nav_data = True
+    visualize_nav_data = False
     lidar_scanner = RayCasterCfg(
         prim_path=f"/World/envs/env_.*/Robot/{base_name}",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.4)),
@@ -173,9 +173,9 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
         max_distance=50.0,
         pattern_cfg=patterns.LidarPatternCfg(
             horizontal_fov_range=(0, 360), # Full 360-degree sweep
-            vertical_fov_range=(-80, 40),  # Looks 40 deg up and 80 deg down
+            vertical_fov_range=(-40, 40),  # Looks 40 deg up and 40 deg down
             horizontal_res=5,              # 
-            channels=int((45+1+90)/2),     # ring every 2 deg vertically
+            channels=int((40+1+40)/2),     # ring every 2 deg vertically
         ),
         debug_vis=visualize_nav_data, 
         mesh_prim_paths=["/World/ground"],
@@ -239,7 +239,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     #  1e-4 then set to 1e-3 for faster learning
 
     # --- Reward Scales ---
-    exploration_reward_scale = 0.5
+    exploration_reward_scale = 4
     
     patrol_boundary_penalty_scale = -10.0
 

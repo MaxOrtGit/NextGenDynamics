@@ -96,7 +96,7 @@ SPIDER_ACTUATOR_CFG = ImplicitActuatorCfg(
         "joint_leg_upper_leg_middle_.*": 80,
         "joint_leg_middle_leg_lower_.*": 50,
     },
-    velocity_limit_sim=100,
+    velocity_limit_sim=50,
     damping={
         "joint_body_leg_hip_.*": 0.8,
         "joint_leg_hip_leg_upper_.*": 1.6,

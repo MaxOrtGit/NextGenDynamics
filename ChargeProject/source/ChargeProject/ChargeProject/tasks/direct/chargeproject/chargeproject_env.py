@@ -18,7 +18,7 @@ from isaaclab.sensors import ContactSensor, RayCaster, RayCasterCfg, patterns
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from .map_manager import MapManager
 from .spider_robot import SPIDER_JOINT_INFO
-from .natural_terrain import SmoothTerrainCfg
+from .natural_terrain import MultiBiomeTerrainCfg
 
 from .chargeproject_env_cfg import ChargeprojectEnvCfg
 
@@ -204,9 +204,9 @@ class ChargeprojectEnv(DirectRLEnv):
         self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         self.scene.sensors["contact_sensor"] = self._contact_sensor
 
-        self._player = RigidObject(self.cfg.player)
+        #self._player = RigidObject(self.cfg.player)
         
-        self.scene.rigid_objects["player"] = self._player
+        #self.scene.rigid_objects["player"] = self._player
 
         # we add a height scanner for perceptive locomotion
         self._lidar_sensor = RayCaster(self.cfg.lidar_scanner)
@@ -243,9 +243,6 @@ class ChargeprojectEnv(DirectRLEnv):
         self.map_manager = MapManager(self.cfg, self.num_envs, terrain_dims, self.device)
 
         if self.cfg.cameras and self.cfg.visualize_nav_data:
-            self.identifier_visualizer = self._create_arrow_markers(
-                self.cfg.marker_colors, "/Visuals/Command/identifier_arrow"
-            )
             self._create_debug_visualizers()
 
             self.loco_height_data = None
@@ -254,7 +251,7 @@ class ChargeprojectEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self._actions = actions.clone()
         
-        self._update_player_movement()
+        #self._update_player_movement()
         
         if self.cfg.cameras and self.cfg.visualize_nav_data:
             # Get data from MapManager
@@ -337,7 +334,7 @@ class ChargeprojectEnv(DirectRLEnv):
                 self.is_contact[:, self.feet_contact_ids].float(),
 
                 # Player relative position
-                self._player.data.root_pos_w - self._robot.data.root_pos_w,
+               # self._player.data.root_pos_w - self._robot.data.root_pos_w,
 
                 # Staleness info
                 far_staleness,
@@ -647,11 +644,11 @@ class ChargeprojectEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
         # Reset the player's position
-        self._player.reset(env_ids)
-        player_pos = self._player.data.default_root_state[env_ids, :7]
-        player_pos[:, :3] += origins
-        self._player.write_root_pose_to_sim(player_pos, env_ids=env_ids)
-        self._player_movement_angle[env_ids] = torch.rand(len(env_ids), device=self.device) * 2 * math.pi
+        #self._player.reset(env_ids)
+        #player_pos = self._player.data.default_root_state[env_ids, :7]
+        #player_pos[:, :3] += origins
+        #self._player.write_root_pose_to_sim(player_pos, env_ids=env_ids)
+        #self._player_movement_angle[env_ids] = torch.rand(len(env_ids), device=self.device) * 2 * math.pi
 
         # Reset MapManager data
         self.map_manager.reset(env_ids)
@@ -662,7 +659,7 @@ class ChargeprojectEnv(DirectRLEnv):
             #    torch.rand(self.num_envs, device=self.device) * self.cfg.time_out_per_target)
 
     def _get_origins(self) -> torch.Tensor:
-        spawn_points = SmoothTerrainCfg.spawns_positions
+        spawn_points = MultiBiomeTerrainCfg.spawns_positions
         loops = np.ceil(self.num_envs / spawn_points.shape[0])
         terrain_offsets = spawn_points.repeat(int(loops), 1)[: self.num_envs]
         return self._terrain.env_origins + terrain_offsets
