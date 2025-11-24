@@ -73,10 +73,12 @@ rewards:
         ang_vel_error
         undesired contacts
         flat orientation
+        hip joint deviation from neutral
+        feet under body penalty
     Patrol:
         Velocity matching target patrol speed
-        Moving towards next patrol point
         Penalize being outside safe area
+        Reward for exploring new areas
     Investigate:
         Moving towards investigation point
         Penalize being outside safe area
@@ -354,8 +356,8 @@ class ChargeprojectEnv(DirectRLEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         
-        # Reward for moving (average of buffer is = to this)
-        movement_reward = torch.linalg.norm(self._robot.data.root_lin_vel_b[:, :2], dim=1)
+        # Reward for moving
+        #movement_reward = torch.linalg.norm(self._robot.data.root_lin_vel_b[:, :2], dim=1)
 
     
         # Bonus for getting to target
@@ -395,12 +397,12 @@ class ChargeprojectEnv(DirectRLEnv):
         feet_air_time = torch.sum((last_air_time - self.cfg.feet_air_time_target) * first_contact, dim=1)
         feet_air_time = torch.clamp(feet_air_time, max=0)
         
-        first_air = self._contact_sensor.compute_first_air(self.step_dt)[
-            :, self.feet_contact_ids
-        ]
-        last_contact_time = self._contact_sensor.data.last_contact_time[:, self.feet_contact_ids]
-        feet_ground_time = torch.sum((last_contact_time - self.cfg.feet_ground_time_target) * first_air, dim=1)
-        feet_ground_time = torch.clamp(feet_ground_time, max=0)
+        #first_air = self._contact_sensor.compute_first_air(self.step_dt)[
+        #    :, self.feet_contact_ids
+        #]
+        #last_contact_time = self._contact_sensor.data.last_contact_time[:, self.feet_contact_ids]
+        #feet_ground_time = torch.sum((last_contact_time - self.cfg.feet_ground_time_target) * first_air, dim=1)
+        #feet_ground_time = torch.clamp(feet_ground_time, max=0)
 
         # undesired contacts
         undesired_contacts = torch.sum(self.is_contact[:, self.undesired_contact_ids], dim=1)
@@ -408,7 +410,7 @@ class ChargeprojectEnv(DirectRLEnv):
             self._contact_sensor.data.current_contact_time[:, self.undesired_contact_ids]
         , dim=1)
         # If 3 or more feet are in contact, consider it stable
-        stable_contact = (torch.sum(self.is_contact[:, self.feet_contact_ids], dim=1) >= self.cfg.stable_contact_feet).float()
+        #stable_contact = (torch.sum(self.is_contact[:, self.feet_contact_ids], dim=1) >= self.cfg.stable_contact_feet).float()
 
         # flat orientation
         flat_orientation = torch.sum(
@@ -417,27 +419,27 @@ class ChargeprojectEnv(DirectRLEnv):
 
 
         # Body height reward
-        base_height = self._robot.data.body_pos_w[:, self.base_body_ids, 2]  # [envs, 1]
-        feet_height = self._robot.data.body_pos_w[:, self.feet_body_ids, 2] # [envs, num_feet]
+        #base_height = self._robot.data.body_pos_w[:, self.base_body_ids, 2]  # [envs, 1]
+        #feet_height = self._robot.data.body_pos_w[:, self.feet_body_ids, 2] # [envs, num_feet]
 
         # Get lowest 3 feet
-        feet_height, _ = torch.topk(feet_height, 3, largest=False, dim=1)
+        #feet_height, _ = torch.topk(feet_height, 3, largest=False, dim=1)
         
         # Compute positive difference
-        body_relative_height = base_height - feet_height
+        #body_relative_height = base_height - feet_height
 
         # Mean or sum over lowest 3 feet (you can adjust depending on desired strength)
-        body_height_reward = torch.mean(body_relative_height, dim=1)  # [envs]
+        #body_height_reward = torch.mean(body_relative_height, dim=1)  # [envs]
 
         # Lower leg upright penalty
-        lower_leg_positions = self._robot.data.body_pos_w[:, self.lower_leg_body_ids]  # [envs, num_lower_legs, 3]
-        feet_pos = self._robot.data.body_pos_w[:, self.feet_body_ids] # [envs, num_feet, 3]
+        #lower_leg_positions = self._robot.data.body_pos_w[:, self.lower_leg_body_ids]  # [envs, num_lower_legs, 3]
+        #feet_pos = self._robot.data.body_pos_w[:, self.feet_body_ids] # [envs, num_feet, 3]
 
         # normalized from lower leg to foot
-        lower_to_foot_vectors = torch.nn.functional.normalize(feet_pos - lower_leg_positions, dim=2) # [envs, num_lower_legs, 3]
-        down_dir = torch.tensor([0, 0, -1.0], device=lower_to_foot_vectors.device)
+        #lower_to_foot_vectors = torch.nn.functional.normalize(feet_pos - lower_leg_positions, dim=2) # [envs, num_lower_legs, 3]
+        #down_dir = torch.tensor([0, 0, -1.0], device=lower_to_foot_vectors.device)
         # Compute deviation from vertical (down direction)
-        lower_leg_reward = torch.mean(torch.mean(lower_to_foot_vectors * down_dir, dim=2), dim=1)  # [envs]
+        #lower_leg_reward = torch.mean(torch.mean(lower_to_foot_vectors * down_dir, dim=2), dim=1)  # [envs]
 
 
         # Hip joint deviation from neutral (0)
@@ -452,7 +454,7 @@ class ChargeprojectEnv(DirectRLEnv):
         # Horizontal distance of each foot from body center
         feet_dist_to_base = torch.linalg.norm(feet_pos_xy - base_pos_xy.unsqueeze(1), dim=2)  # [envs, num_feet]
 
-        # Feet that are within the body cylinder (radius < 0.25)
+        # Feet that are within the body cylinder
         under_body_mask = feet_dist_to_base < self.cfg.body_penalty_radius
 
         # Compute how deep they are inside (closer to center = higher penalty)
@@ -461,7 +463,7 @@ class ChargeprojectEnv(DirectRLEnv):
         # Mean penalty per environment (across all feet)
         feet_under_body_penalty = torch.mean(under_body_depth * under_body_mask.float(), dim=1)
 
-
+        """
         # Reward for stepping up/down
         current_air_time = self._contact_sensor.data.current_air_time[:, self.feet_contact_ids]
         feet_in_contact = self.is_contact[:, self.feet_contact_ids]
@@ -519,6 +521,8 @@ class ChargeprojectEnv(DirectRLEnv):
         # Mean squared deviation
         joint_default_penalty = torch.mean(torch.square(joint_deviation), dim=1)
 
+        """
+        # TODO: instead of mask at end do math on specific states only
         # Patrol specific rewards
         patrol_mask = (self.robot_state == RobotState.PATROL).float()
         exploration_reward = self.last_exploration_bonus 
@@ -531,13 +535,17 @@ class ChargeprojectEnv(DirectRLEnv):
         excess_dist = torch.clamp(dist - self.cfg.patrol_size, min=0.0)
         boundary_penalty = torch.square(excess_dist)
 
+        velocity_matching = torch.square(torch.linalg.norm(self._robot.data.root_lin_vel_b[:, :2]) - self.cfg.patrol_target_velocity)
+
         rewards = {
             # Patrol specific rewards
-            "exploration_reward": patrol_mask * exploration_reward * self.cfg.exploration_reward_scale * self.step_dt,
+            "patrol_exploration_reward": patrol_mask * exploration_reward * self.cfg.exploration_reward_scale * self.step_dt,
             "patrol_boundary_penalty": patrol_mask * boundary_penalty * self.cfg.patrol_boundary_penalty_scale * self.step_dt,
+            "patrol_velocity_matching": patrol_mask * velocity_matching * self.cfg.patrol_velocity_matching_penalty_scale * self.step_dt,
+            
             "reach_target_reward": target_reward * self.cfg.reach_target_reward_scale * self.step_dt,
             "death_penalty": death_penalty * self.cfg.death_penalty_scale * self.step_dt,
-            "movement_reward": movement_reward * self.cfg.movement_reward_scale * self.step_dt,
+            #"movement_reward": movement_reward * self.cfg.movement_reward_scale * self.step_dt,
             "z_vel_l2": z_vel_error * self.cfg.z_vel_reward_scale * self.step_dt,
             "ang_vel_xy_l2": ang_vel_error * self.cfg.ang_vel_reward_scale * self.step_dt,
             "dof_torques_l2": joint_torques * self.cfg.joint_torque_reward_scale * self.step_dt,
@@ -545,21 +553,21 @@ class ChargeprojectEnv(DirectRLEnv):
             "dof_vel_l2": joint_vel * self.cfg.dof_vel_reward_scale * self.step_dt,
             "action_rate_l2": action_rate * self.cfg.action_rate_reward_scale * self.step_dt,
             "feet_air_time": feet_air_time * self.cfg.feet_air_time_reward_scale * self.step_dt,
-            "feet_ground_time": feet_ground_time * self.cfg.feet_ground_time_reward_scale * self.step_dt,
+            #"feet_ground_time": feet_ground_time * self.cfg.feet_ground_time_reward_scale * self.step_dt,
             "undesired_contacts": undesired_contacts * self.cfg.undesired_contact_reward_scale * self.step_dt,
             "undesired_contact_time": undesired_contact_time * self.cfg.undesired_contact_time_reward_scale * self.step_dt,
-            "desired_contacts": stable_contact * self.cfg.desired_contact_reward_scale * self.step_dt,
+            #"desired_contacts": stable_contact * self.cfg.desired_contact_reward_scale * self.step_dt,
             "flat_orientation_l2": flat_orientation * self.cfg.flat_orientation_reward_scale * self.step_dt,
-            "body_height_reward": body_height_reward * self.cfg.body_height_reward_scale * self.step_dt,
-            "lower_leg_reward": lower_leg_reward * self.cfg.lower_leg_reward_scale * self.step_dt,
+            #"body_height_reward": body_height_reward * self.cfg.body_height_reward_scale * self.step_dt,
+            #"lower_leg_reward": lower_leg_reward * self.cfg.lower_leg_reward_scale * self.step_dt,
             "hip_penalty": hip_penalty * self.cfg.hip_penalty_scale * self.step_dt,
             "feet_under_body_penalty": feet_under_body_penalty * self.cfg.feet_under_body_penalty_scale * self.step_dt,
-            "step_reward": step_reward * self.cfg.step_reward_scale * self.step_dt,
-            "step_length_penalty": step_length_penalty * self.cfg.step_length_penalty_scale * self.step_dt,
-            "grounded_length_penalty": grounded_length_penalty * self.cfg.grounded_length_penalty_scale * self.step_dt,
-            "feet_up_step_counter_penalty": self.feet_up_step_counter_penalty * self.cfg.feet_up_step_time_penalty_scale * self.step_dt,
-            "feet_down_step_counter_penalty": self.feet_down_step_counter_penalty * self.cfg.feet_down_step_time_penalty_scale * self.step_dt,
-            "joint_default_penalty": joint_default_penalty * self.cfg.joint_default_penalty * self.step_dt,
+            #"step_reward": step_reward * self.cfg.step_reward_scale * self.step_dt,
+            #"step_length_penalty": step_length_penalty * self.cfg.step_length_penalty_scale * self.step_dt,
+            #"grounded_length_penalty": grounded_length_penalty * self.cfg.grounded_length_penalty_scale * self.step_dt,
+            #"feet_up_step_counter_penalty": self.feet_up_step_counter_penalty * self.cfg.feet_up_step_time_penalty_scale * self.step_dt,
+            #"feet_down_step_counter_penalty": self.feet_down_step_counter_penalty * self.cfg.feet_down_step_time_penalty_scale * self.step_dt,
+            #"joint_default_penalty": joint_default_penalty * self.cfg.joint_default_penalty * self.step_dt,
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)

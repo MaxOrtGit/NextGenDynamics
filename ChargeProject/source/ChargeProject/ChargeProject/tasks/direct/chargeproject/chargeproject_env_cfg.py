@@ -140,7 +140,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=int(1024*4),#0),
+        num_envs=int(1024*1.5),#0),
         env_spacing=4.0, 
         replicate_physics=True
     )
@@ -239,9 +239,10 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     #  1e-4 then set to 1e-3 for faster learning
 
     # --- Reward Scales ---
-    exploration_reward_scale = 4
-    
+    exploration_reward_scale = 0.5
     patrol_boundary_penalty_scale = -10.0
+    patrol_velocity_matching_penalty_scale = -0.5
+    patrol_target_velocity = 0.5 # m/s
 
     # Multiplied by targets hit reward
     reach_target_reward_scale = 1000 * 4 # == add * 4
@@ -260,7 +261,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     feet_ground_time_reward_scale = 40
     feet_ground_time_target = 0.5 # set to 0.4 after start (was 0.7 but not sure if this matters) # ---- set 0.35 # ----- set to 0.6
     
-    undesired_contact_reward_scale = -50
+    undesired_contact_reward_scale = -2
     undesired_contact_time_reward_scale = -15
     desired_contact_reward_scale = 10 * 4 / 8 # add (*4) after start ---- add / 8
     stable_contact_feet = 2 # ---- set to 2 (was 3)

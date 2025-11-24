@@ -43,7 +43,7 @@
             "type": "python",
             "request": "launch",
             "args" : ["--task", "Chargeproject-Direct-v0", "--headless",
-                      //"--video", "--video_interval", "500", "--video_length", "500", // "--rendering_mode", "performance",
+                      "--video", "--video_interval", "500", "--video_length", "500", // "--rendering_mode", "performance",
                       //"--checkpoint", "checkpoints/Spider/agent_126500.pt"
                     ],
             "program": "${workspaceFolder}/scripts/skrlcustom/train.py",

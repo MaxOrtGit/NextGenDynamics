@@ -135,7 +135,7 @@ SPIDER_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.525),  # start above the ground
+        pos=(0.0, 0.0, 0.265),  # start above the ground
         # Default angles: body-hip=0°, hip-upper=30°, upper-middle=-65°, middle--lower=-55°
         joint_pos=SPIDER_JOINT_INFO["default_pos"],
     ),

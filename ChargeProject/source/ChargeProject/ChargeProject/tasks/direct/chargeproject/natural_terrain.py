@@ -194,7 +194,7 @@ def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple
     for _ in range(cfg.num_blocks):
         sx = rng.uniform(cfg.block_size_min, cfg.block_size_max)
         sy = rng.uniform(cfg.block_size_min, cfg.block_size_max)
-        sz = rng.uniform(cfg.block_height_min, cfg.block_height_max)
+        sz = rng.uniform(cfg.block_height_min, cfg.block_height_max) + 2.0
         pos_x = rng.uniform(2.0, width_m - 2.0)
         pos_y = rng.uniform(2.0, length_m - 2.0)
         
@@ -217,7 +217,7 @@ def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple
         else:
             ground_z = raw_z
 
-        pos_z = ground_z + (sz / 2.0)
+        pos_z = ground_z + (sz / 2.0) - 1.0
         
         box = trimesh.creation.box(extents=(sx, sy, sz))
         transform = np.eye(4)
@@ -239,8 +239,8 @@ class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
 
     # --- Terrain Shape (The Geometry) ---
     noise_seed: int = 1234
-    noise_scale: float = 0.1       
-    noise_height_scale: float = 2.5
+    noise_scale: float = 0.05       # Frequency of the Perlin noise (higher = more hills/valleys)
+    noise_height_scale: float = 2.5 # Amplitude of the Perlin noise
     noise_octaves: int = 5
     noise_persistence: float = 0.5
     noise_lacunarity: float = 2.0
@@ -251,21 +251,22 @@ class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
     # --- THE BIOME LIST ---
     biomes: List[BiomeCfg] = field(default_factory=lambda: [
         BiomeCfg(weight=1.1, step_size=0.0), # Smooth
+        BiomeCfg(weight=1.0, step_size=0.05),
         BiomeCfg(weight=1.0, step_size=0.1),
         BiomeCfg(weight=0.9, step_size=0.2),
-        BiomeCfg(weight=0.8, step_size=0.3),
-        BiomeCfg(weight=0.7, step_size=0.5), # Giant cliffs
+        #BiomeCfg(weight=0.8, step_size=0.3),
+        BiomeCfg(weight=0.7, step_size=0.3), # Giant cliffs
     ])
 
     # --- Objects ---
-    num_blocks: int = 800             
+    num_blocks: int = 500             
     block_size_min: float = 0.5; block_size_max: float = 1.5      
     block_height_min: float = 1.0; block_height_max: float = 2.5    
 
     num_spawns_per_side = 5
     spacing_m = 20.0  
     spawns_positions: np.ndarray = None
-    platform_width: float = 1.5  
+    platform_width: float = 1.75  
 
 terrain_gen_cfg = TerrainGeneratorCfg(
     seed=42,
