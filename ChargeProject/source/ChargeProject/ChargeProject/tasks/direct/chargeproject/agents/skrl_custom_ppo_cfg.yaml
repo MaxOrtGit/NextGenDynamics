@@ -8,7 +8,7 @@ seed: 42
 
 # Model defined in skrl_custom_ppo_model.py
 model:
-  log_std_init: -1.5 #-2.5
+  log_std_init: -1.0 #-2.5
   #gain: 0.7
 
 

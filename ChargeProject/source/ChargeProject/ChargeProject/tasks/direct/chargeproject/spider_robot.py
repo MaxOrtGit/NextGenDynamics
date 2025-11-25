@@ -96,7 +96,7 @@ SPIDER_ACTUATOR_CFG = ImplicitActuatorCfg(
         "joint_leg_upper_leg_middle_.*": 300,
         "joint_leg_middle_leg_lower_.*": 200,
     },
-    velocity_limit_sim=50,
+    velocity_limit_sim=20.0,
     damping={
         "joint_body_leg_hip_.*": 2.0,
         "joint_leg_hip_leg_upper_.*": 5.0,
@@ -126,7 +126,7 @@ SPIDER_CFG = ArticulationCfg(
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=True,
-            solver_position_iteration_count=8,
+            solver_position_iteration_count=4,
             solver_velocity_iteration_count=1,
         ),
         collision_props=sim_utils.CollisionPropertiesCfg(

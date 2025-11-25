@@ -496,8 +496,7 @@ class ChargeprojectEnv(DirectRLEnv):
             :, self.feet_contact_ids
         ]
         last_air_time = self._contact_sensor.data.last_air_time[:, self.feet_contact_ids]
-        feet_air_time = torch.sum((last_air_time - self.cfg.feet_air_time_target) * first_contact, dim=1)
-        feet_air_time = torch.clamp(feet_air_time, max=0)
+        feet_air_time = torch.sum((last_air_time - 0.5) * first_contact, dim=1)
         
         #first_air = self._contact_sensor.compute_first_air(self.step_dt)[
         #    :, self.feet_contact_ids
@@ -659,14 +658,14 @@ class ChargeprojectEnv(DirectRLEnv):
             "patrol_boundary_penalty": patrol_mask * boundary_penalty * self.cfg.patrol_boundary_penalty_scale * self.step_dt,
             "patrol_velocity_matching": patrol_mask * velocity_matching * self.cfg.patrol_velocity_matching_penalty_scale * self.step_dt,
 
-            "reach_target_reward": target_reward * self.cfg.reach_target_reward_scale * self.step_dt,
-            "death_penalty": death_penalty * self.cfg.death_penalty_scale * self.step_dt,
+            #"reach_target_reward": target_reward * self.cfg.reach_target_reward_scale * self.step_dt,
+            #"death_penalty": death_penalty * self.cfg.death_penalty_scale * self.step_dt,
             #"movement_reward": movement_reward * self.cfg.movement_reward_scale * self.step_dt,
             "z_vel_l2": z_vel_error * self.cfg.z_vel_reward_scale * self.step_dt,
             "ang_vel_xy_l2": ang_vel_error * self.cfg.ang_vel_reward_scale * self.step_dt,
             "dof_torques_l2": joint_torques * self.cfg.joint_torque_reward_scale * self.step_dt,
             "dof_acc_l2": joint_accel * self.cfg.joint_accel_reward_scale * self.step_dt,
-            "dof_vel_l2": joint_vel * self.cfg.dof_vel_reward_scale * self.step_dt,
+            #"dof_vel_l2": joint_vel * self.cfg.dof_vel_reward_scale * self.step_dt,
             "action_rate_l2": action_rate * self.cfg.action_rate_reward_scale * self.step_dt,
             "feet_air_time": feet_air_time * self.cfg.feet_air_time_reward_scale * self.step_dt,
             #"feet_ground_time": feet_ground_time * self.cfg.feet_ground_time_reward_scale * self.step_dt,

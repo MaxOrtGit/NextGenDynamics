@@ -78,9 +78,9 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     state_space = 0 #idk why this is here
 
     # simulation
-    decimation = 2
+    decimation = 4
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 60, render_interval=decimation,
+        dt=1 / 200, render_interval=decimation,
         physx=PhysxCfg(
             gpu_collision_stack_size = 2**29,
             gpu_max_rigid_patch_count = 2**19
@@ -202,7 +202,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     marker_colors = 57
 
     # Final rewards
-    action_scale = 1.0
+    action_scale = 0.5
     
 
     # Training stages:
@@ -241,34 +241,34 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     # --- Reward Scales ---
     patrol_exploration_reward_scale = 0.5 * 0.0
     patrol_boundary_penalty_scale = -10.0
-    patrol_velocity_matching_penalty_scale = -15.0
+    patrol_velocity_matching_penalty_scale = -0.25
     patrol_target_velocity = 1.0 # m/s
 
     # Multiplied by targets hit reward
     reach_target_reward_scale = 1000 * 4 # == add * 4
-    death_penalty_scale = -2000
+    death_penalty_scale = -200
     movement_reward_scale = 30 / 6 / 2 * 2 # -- add / 6 # ---- add / 2 # = add * 2
-    z_vel_reward_scale = -120 * 3 / 2 / 10 # add (*3) after start # ---- add / 2
-    ang_vel_reward_scale = -2.7 / 4 # add ---- / 4
+    z_vel_reward_scale = -2.0 
+    ang_vel_reward_scale = -0.05
 
-    joint_torque_reward_scale = -0.0015 / 5 / 1.5  / 8 # ---- add / 5
-    joint_accel_reward_scale = -5.3e-07 / 6 * 2 / 2 / 10 # add /6 after start # ---- add * 2
-    dof_vel_reward_scale = -0.006 / 8  / 2 / 10  # add /8 after start
-    action_rate_reward_scale = -1.5 / 2 / 3 * 4 / 40 # add /2 after start # ---- add / 3
+    joint_torque_reward_scale = -2.5e-5 / 2
+    joint_accel_reward_scale = -2.5e-7 / 2 / 150
+    dof_vel_reward_scale = 0.0
+    action_rate_reward_scale = -0.01 / 2
 
-    feet_air_time_reward_scale = 26.6 / 2
+    feet_air_time_reward_scale = 0.5 / 1.5
     feet_air_time_target = 0.5 # set to 0.4 after start (was 0.7 but not sure if this matters) # ---- set 0.35 # ----- set to 0.6
     feet_ground_time_reward_scale = 40
     feet_ground_time_target = 0.5 # set to 0.4 after start (was 0.7 but not sure if this matters) # ---- set 0.35 # ----- set to 0.6
     
-    undesired_contact_reward_scale = -4
+    undesired_contact_reward_scale = -1.0
     undesired_contact_time_reward_scale = -15
     desired_contact_reward_scale = 10 * 4 / 8 # add (*4) after start ---- add / 8
     stable_contact_feet = 2 # ---- set to 2 (was 3)
-    flat_orientation_reward_scale = -1200 / 4 / 2# -- add / 3 # ---- add /4 # = add / 2
+    flat_orientation_reward_scale = -5.0
     body_height_reward_scale = 114 / 2 / 2 # * 4 # Remove (*4) after init # add (/2) after start # ----- add / 2
     lower_leg_reward_scale = 200 / 10 # add (/10) after start
-    hip_penalty_scale = -30 / 5 # ---- Add / 5
+    hip_penalty_scale = 0#-30 / 5 # ---- Add / 5
     feet_under_body_penalty_scale = -72000 * 2 / 8# add (*2) after start # == add / 8
     body_penalty_radius = 0.175
 
