@@ -63,7 +63,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     # - spaces definition
     action_space = 24
     observation_space = spaces.Dict({
-        "observations": spaces.Box(-math.inf, math.inf, shape=(98 - 3,), dtype=float),
+        "observations": spaces.Box(-math.inf, math.inf, shape=(97,), dtype=float),
         "height_data": spaces.Box(-math.inf, math.inf, shape=(25, 25), dtype=float),
         "nav_data": spaces.Box(-math.inf, math.inf, shape=(3, 33, 33), dtype=float)
     })
@@ -78,7 +78,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     state_space = 0 #idk why this is here
 
     # simulation
-    decimation = 1
+    decimation = 2
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 60, render_interval=decimation,
         physx=PhysxCfg(
@@ -202,7 +202,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     marker_colors = 57
 
     # Final rewards
-    action_scale = 1
+    action_scale = 1.0
     
 
     # Training stages:
@@ -239,29 +239,29 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     #  1e-4 then set to 1e-3 for faster learning
 
     # --- Reward Scales ---
-    exploration_reward_scale = 0.5
+    patrol_exploration_reward_scale = 0.5 * 0.0
     patrol_boundary_penalty_scale = -10.0
-    patrol_velocity_matching_penalty_scale = -0.5
-    patrol_target_velocity = 0.5 # m/s
+    patrol_velocity_matching_penalty_scale = -15.0
+    patrol_target_velocity = 1.0 # m/s
 
     # Multiplied by targets hit reward
     reach_target_reward_scale = 1000 * 4 # == add * 4
     death_penalty_scale = -2000
     movement_reward_scale = 30 / 6 / 2 * 2 # -- add / 6 # ---- add / 2 # = add * 2
-    z_vel_reward_scale = -120 * 3 / 2 # add (*3) after start # ---- add / 2
+    z_vel_reward_scale = -120 * 3 / 2 / 10 # add (*3) after start # ---- add / 2
     ang_vel_reward_scale = -2.7 / 4 # add ---- / 4
 
-    joint_torque_reward_scale = -0.0015 / 5 # ---- add / 5
-    joint_accel_reward_scale = -5.3e-07 / 6 * 2 # add /6 after start # ---- add * 2
-    dof_vel_reward_scale = -0.006 / 8 # add /8 after start
-    action_rate_reward_scale = -1.5 / 2 / 3 # add /2 after start # ---- add / 3
+    joint_torque_reward_scale = -0.0015 / 5 / 1.5  / 8 # ---- add / 5
+    joint_accel_reward_scale = -5.3e-07 / 6 * 2 / 2 / 10 # add /6 after start # ---- add * 2
+    dof_vel_reward_scale = -0.006 / 8  / 2 / 10  # add /8 after start
+    action_rate_reward_scale = -1.5 / 2 / 3 * 4 / 40 # add /2 after start # ---- add / 3
 
-    feet_air_time_reward_scale = 26.6
+    feet_air_time_reward_scale = 26.6 / 2
     feet_air_time_target = 0.5 # set to 0.4 after start (was 0.7 but not sure if this matters) # ---- set 0.35 # ----- set to 0.6
     feet_ground_time_reward_scale = 40
     feet_ground_time_target = 0.5 # set to 0.4 after start (was 0.7 but not sure if this matters) # ---- set 0.35 # ----- set to 0.6
     
-    undesired_contact_reward_scale = -2
+    undesired_contact_reward_scale = -4
     undesired_contact_time_reward_scale = -15
     desired_contact_reward_scale = 10 * 4 / 8 # add (*4) after start ---- add / 8
     stable_contact_feet = 2 # ---- set to 2 (was 3)

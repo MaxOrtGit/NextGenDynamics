@@ -14,25 +14,28 @@ class BiomeCfg:
     weight: float = 1.0       # The "strength" of this biome in the competition
     step_size: float = 0.0    # 0.0 = Smooth. >0.0 = Stepped height.
 
+
 def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple[list[trimesh.Trimesh], np.ndarray]:
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     
-    if cfg.size[0] != cfg.size[1]:
-        raise ValueError(f"The terrain must be square. Received size: {cfg.size}.")
-
-    meshes_list = list()
-    grid_width = cfg.grid_width
-    width_m, length_m = cfg.size[0], cfg.size[1]
+    # --- 1. SETUP & CONSTANTS ---
+    # Resolution of the ground mesh (meters). 
+    # 0.1 provides steep "walls" for steps which physics engines like.
+    res = 0.1 
     
-    # Grid setup
-    start_pos_x = (width_m / 2.0) - ((cfg.num_spawns_per_side - 1) * cfg.spacing_m / 2.0)
-    start_pos_y = (length_m / 2.0) - ((cfg.num_spawns_per_side - 1) * cfg.spacing_m / 2.0)
+    width_m, length_m = cfg.size[0], cfg.size[1]
+    nx = int(width_m / res)
+    ny = int(length_m / res)
+    
+    # Center offsets for noise calculations
+    x_center_offset = (width_m / 2.0)
+    y_center_offset = (length_m / 2.0)
 
-    # --- NOISE HELPERS ---
+    # --- 2. NOISE HELPERS (Vectorized for Mesh, Single for Blocks) ---
     v_pnoise = np.vectorize(pnoise2)
 
     def get_raw_height_noise(x_vals, y_vals):
-        """Standard Perlin noise for the underlying geometry (Hills/Valleys)"""
+        """Calculates base terrain height (hills/valleys) at specific coordinates."""
         return v_pnoise(
             x_vals * cfg.noise_scale, 
             y_vals * cfg.noise_scale, 
@@ -42,194 +45,169 @@ def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple
             repeatx=1024, repeaty=1024, base=cfg.noise_seed
         ) * cfg.noise_height_scale
 
-    def get_biome_indices(x_vals, y_vals):
-        """
-        DETERMINES THE WINNING BIOME FOR EACH POINT.
-        Strategy: ArgMax Competition.
-        We generate a noise value for EACH biome type. 
-        The biome with the highest (Noise * Weight) at that specific x,y wins.
-        """
-        # Array to store scores: Shape (Num_Biomes, Num_Points)
-        num_points = len(x_vals)
-        scores = np.zeros((len(cfg.biomes), num_points))
+    def get_biome_at_points(x_vals, y_vals):
+        """Returns the biome index and weight for given coordinates."""
+        num_p = len(x_vals)
+        scores = np.zeros((len(cfg.biomes), num_p))
 
         for i, biome in enumerate(cfg.biomes):
-            # Generate a unique noise map for this biome
-            # We offset the seed by 'i * 500' so they are completely uncorrelated
             noise_val = v_pnoise(
                 x_vals * cfg.biome_blend_scale, 
                 y_vals * cfg.biome_blend_scale, 
-                octaves=1, # Keep blend noise simple/fast
+                octaves=1, 
                 repeatx=1024, repeaty=1024, base=cfg.noise_seed + ((1+i) * 500)
             )
-            
-            # Normalize noise from [-1, 1] to [0, 1] roughly, so weights act as multipliers
-            # Adding 1.0 makes it [0, 2].
-            positive_noise = noise_val + 1.0
-            
-            # Calculate Score
-            scores[i] = positive_noise * biome.weight
-
-        # Returns the index (0 to N-1) of the winning biome for each point
+            scores[i] = (noise_val + 1.0) * biome.weight
+        
         return np.argmax(scores, axis=0)
-    
-    # ---------------------
 
-    # Setup Spawns
-    spawn_x = np.linspace(start_pos_x, start_pos_x + cfg.spacing_m * (cfg.num_spawns_per_side - 1), cfg.num_spawns_per_side)
-    spawn_y = np.linspace(start_pos_y, start_pos_y + cfg.spacing_m * (cfg.num_spawns_per_side - 1), cfg.num_spawns_per_side)
-    spawn_xx, spawn_yy = np.meshgrid(spawn_x, spawn_y)
-    spawn_x_flat = spawn_xx.flatten()
-    spawn_y_flat = spawn_yy.flatten()
+    # --- 3. GENERATE GROUND MESH ---
+    # Create Grid
+    x = torch.linspace(0, width_m, nx, device=device)
+    y = torch.linspace(0, length_m, ny, device=device)
+    xx, yy = torch.meshgrid(x, y, indexing="ij")
+    
+    x_flat = xx.flatten()
+    y_flat = yy.flatten()
+    
+    # Shift to noise coordinates (centered)
+    x_np = (x_flat - x_center_offset).cpu().numpy()
+    y_np = (y_flat - y_center_offset).cpu().numpy()
 
-    # Calculate Spawn Heights
-    spawn_raw_z = get_raw_height_noise(spawn_x_flat, spawn_y_flat)
-    spawn_biome_indices = get_biome_indices(spawn_x_flat, spawn_y_flat)
-    
-    spawn_z_final = np.zeros_like(spawn_raw_z)
-    
-    # Apply biome logic to spawns
-    for i in range(len(spawn_x_flat)):
-        b_idx = spawn_biome_indices[i]
-        biome = cfg.biomes[b_idx]
+    # Calculate Terrain Heights
+    raw_z = get_raw_height_noise(x_np, y_np)
+    winning_biomes = get_biome_at_points(x_np, y_np)
+    final_z = np.zeros_like(raw_z)
+
+    # Apply Steps vs Smooth logic
+    for i, biome in enumerate(cfg.biomes):
+        mask = (winning_biomes == i)
+        if not np.any(mask): continue
+        z_chunk = raw_z[mask]
         
         if biome.step_size > 0.001:
-            # Stepped
-            spawn_z_final[i] = np.floor(spawn_raw_z[i] / biome.step_size) * biome.step_size
+            final_z[mask] = np.floor(z_chunk / biome.step_size) * biome.step_size
         else:
-            # Smooth
-            spawn_z_final[i] = spawn_raw_z[i]
+            final_z[mask] = z_chunk
 
-    # Generate Grid Boxes
-    num_boxes_x = int(cfg.size[0] / grid_width)
-    num_boxes_y = int(cfg.size[1] / grid_width)
+    # --- 4. FLATTEN SPAWN PLATFORMS ---
+    # Define spawn grid
+    start_pos_x = (width_m / 2.0) - ((cfg.num_spawns_per_side - 1) * cfg.spacing_m / 2.0)
+    start_pos_y = (length_m / 2.0) - ((cfg.num_spawns_per_side - 1) * cfg.spacing_m / 2.0)
     
-    grid_dim = [grid_width, grid_width, cfg.terrain_height]
-    grid_position = [0.5 * grid_width, 0.5 * grid_width, -cfg.terrain_height / 2]
+    spawn_grid_x = np.linspace(start_pos_x, start_pos_x + cfg.spacing_m * (cfg.num_spawns_per_side - 1), cfg.num_spawns_per_side)
+    spawn_grid_y = np.linspace(start_pos_y, start_pos_y + cfg.spacing_m * (cfg.num_spawns_per_side - 1), cfg.num_spawns_per_side)
     
-    template_box = trimesh.creation.box(grid_dim, trimesh.transformations.translation_matrix(grid_position))
-    template_vertices = template_box.vertices 
-    
-    vertices = torch.tensor(template_vertices, device=device).repeat(num_boxes_x * num_boxes_y, 1, 1)
-    
-    x_coords = torch.arange(0, num_boxes_x, device=device)
-    y_coords = torch.arange(0, num_boxes_y, device=device)
-    xx, yy = torch.meshgrid(x_coords, y_coords, indexing="ij")
-    xx_yy = torch.cat((xx.flatten().view(-1, 1), yy.flatten().view(-1, 1)), dim=1)
-    offsets = grid_width * xx_yy
-    vertices[:, :, :2] += offsets.unsqueeze(1)
-    
-    # --- APPLY BIOME HEIGHTS ---
-    
-    # Calculate Box Centers (for Biome Selection + Stepped Heights)
-    box_centers = vertices.mean(dim=1)[:, :2].cpu().numpy()
-    
-    # Calculate Raw Height at Center
-    raw_z_centers = get_raw_height_noise(box_centers[:, 0], box_centers[:, 1])
-    
-    # Determine Biome at Center
-    # We use the box center to decide the biome for the whole box (avoids jagged box-splits)
-    winning_indices = get_biome_indices(box_centers[:, 0], box_centers[:, 1])
-    
-    # Calculate Smooth Heights per Vertex (for Smooth Biomes)
-    all_vertices_cpu = vertices.reshape(-1, 3)[:, :2].cpu().numpy()
-    raw_z_vertices = get_raw_height_noise(all_vertices_cpu[:, 0], all_vertices_cpu[:, 1])
-    raw_z_vertices = raw_z_vertices.reshape(-1, 8) # Shape back to (N, 8)
-    
-    # Construct Final Height Map
-    final_z_vals = np.zeros_like(raw_z_vertices) # (N, 8)
-    
-    # Iterate through unique biomes to vectorize the assignment
-    for b_idx, biome in enumerate(cfg.biomes):
-        # Mask: Which boxes belong to this biome?
-        mask_indices = (winning_indices == b_idx) # Boolean array of shape (N,)
-        
-        if not np.any(mask_indices):
-            continue
-
-        if biome.step_size > 0.001:
-            # STEPPED: Use Center Z, quantize it, apply to all 8 verts
-            z_centered = raw_z_centers[mask_indices]
-            z_stepped = np.floor(z_centered / biome.step_size) * biome.step_size
-            # Broadcast (M,) -> (M, 8)
-            final_z_vals[mask_indices, :] = z_stepped[:, np.newaxis]
-        else:
-            # SMOOTH: Use per-vertex Z
-            final_z_vals[mask_indices, :] = raw_z_vertices[mask_indices, :]
-
-    final_z_torch = torch.tensor(final_z_vals, device=device, dtype=torch.float32).view(-1, 8)
-    mask_top = vertices[:, :, 2] > -0.1
-    vertices[:, :, 2] += final_z_torch * mask_top.float()
-
-    # Platforms
+    # We flatten the ground mesh at these locations
     half_plat = cfg.platform_width / 2.0
+    spawn_origins_list = [] # For Isaac Lab config
+
+    # Flatten mesh loops
+    for sx in spawn_grid_x:
+        for sy in spawn_grid_y:
+            # Map spawn world pos -> Noise pos
+            sx_noise = sx - x_center_offset
+            sy_noise = sy - y_center_offset
+            
+            # Distance check against all mesh points (Optimized via mask)
+            dx = np.abs(x_np - sx_noise)
+            dy = np.abs(y_np - sy_noise)
+            
+            dist_mask = (dx < half_plat) & (dy < half_plat)
+            
+            if np.any(dist_mask):
+                # Flatten this area to the average height
+                center_val = np.mean(final_z[dist_mask]) 
+                final_z[dist_mask] = center_val
+                
+                # Save for the robot spawn config later
+                # z + 0.5 so the robot drops slightly
+                spawn_origins_list.append([sx, sy, center_val]) 
+
+    # --- 5. BUILD TERRAIN MESH ---
+    # Vertices (x_flat is 0..width, y_flat is 0..length)
+    vertices = np.stack([x_flat.cpu().numpy(), y_flat.cpu().numpy(), final_z], axis=1)
+
+    # Faces (Grid Topology)
+    ids = np.arange(nx * ny).reshape(nx, ny)
+    f1 = np.stack([ids[:-1, :-1], ids[1:, :-1], ids[:-1, 1:]], axis=2).reshape(-1, 3)
+    f2 = np.stack([ids[1:, :-1], ids[1:, 1:], ids[:-1, 1:]], axis=2).reshape(-1, 3)
+    faces = np.vstack([f1, f2])
+
+    ground_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+    ground_mesh.fix_normals()
     
-    for i in range(len(spawn_x_flat)):
-        sx = spawn_x_flat[i]
-        sy = spawn_y_flat[i]
-        target_z = spawn_z_final[i]
-        
-        mask_platform = (
-            (vertices[:, :, 0] >= sx - half_plat) & 
-            (vertices[:, :, 0] <= sx + half_plat) & 
-            (vertices[:, :, 1] >= sy - half_plat) & 
-            (vertices[:, :, 1] <= sy + half_plat) &
-            mask_top
-        )
-        vertices[:, :, 2][mask_platform] = float(target_z)
-
-    # Mesh
-    vertices_np = vertices.reshape(-1, 3).cpu().numpy()
-    faces = torch.tensor(template_box.faces, device=device).repeat(num_boxes_x * num_boxes_y, 1, 1)
-    face_offsets = torch.arange(0, num_boxes_x * num_boxes_y, device=device).unsqueeze(1).repeat(1, 12) * 8
-    faces += face_offsets.unsqueeze(2)
-    faces_np = faces.view(-1, 3).cpu().numpy()
-
-    ground_mesh = trimesh.Trimesh(vertices=vertices_np, faces=faces_np)
     meshes_list = [ground_mesh]
 
-    # --- BLOCKS (With Biome Awareness) ---
+    # --- 6. GENERATE BLOCKS (The requested part) ---
     rng = np.random.default_rng(seed=cfg.seed)
     
+    # Flatten spawn list for fast distance checking
+    spawn_origins_arr = np.array(spawn_origins_list) if len(spawn_origins_list) > 0 else np.empty((0,3))
+
     for _ in range(cfg.num_blocks):
+        # Random Size
         sx = rng.uniform(cfg.block_size_min, cfg.block_size_max)
         sy = rng.uniform(cfg.block_size_min, cfg.block_size_max)
-        sz = rng.uniform(cfg.block_height_min, cfg.block_height_max) + 2.0
+        sz = rng.uniform(cfg.block_height_min, cfg.block_height_max)
+        
+        # Random Position (World Coords)
         pos_x = rng.uniform(2.0, width_m - 2.0)
         pos_y = rng.uniform(2.0, length_m - 2.0)
-        
-        # Check Platform
-        is_on_platform = False
-        for i in range(len(spawn_x_flat)):
-            dist_x = abs(pos_x - spawn_x_flat[i])
-            dist_y = abs(pos_y - spawn_y_flat[i])
-            if dist_x < (cfg.platform_width / 2 + sx/2) and dist_y < (cfg.platform_width / 2 + sy/2):
-                is_on_platform = True; break
-        if is_on_platform: continue 
 
-        # Determine Height based on Biome
-        b_idx = get_biome_indices(np.array([pos_x]), np.array([pos_y]))[0]
+        # 6a. Check Platform Collision
+        # We don't want to block the spawn pads
+        is_on_platform = False
+        if len(spawn_origins_arr) > 0:
+            # Vectorized distance check against all spawn points
+            dists_x = np.abs(pos_x - spawn_origins_arr[:, 0])
+            dists_y = np.abs(pos_y - spawn_origins_arr[:, 1])
+            # If inside any platform box
+            if np.any((dists_x < (half_plat + sx)) & (dists_y < (half_plat + sy))):
+                is_on_platform = True
+        
+        if is_on_platform: 
+            continue 
+
+        # 6b. Calculate Height at this specific spot
+        # We must transform World Coords -> Noise Coords
+        pos_x_noise = pos_x - x_center_offset
+        pos_y_noise = pos_y - y_center_offset
+        
+        # Re-run the biome logic for this single point to get exact ground height
+        # This ensures the block sits perfectly on steps or smooth slopes
+        b_idx = get_biome_at_points(np.array([pos_x_noise]), np.array([pos_y_noise]))[0]
         biome = cfg.biomes[b_idx]
-        raw_z = get_raw_height_noise(np.array([pos_x]), np.array([pos_y]))[0]
+        raw_z_block = get_raw_height_noise(np.array([pos_x_noise]), np.array([pos_y_noise]))[0]
         
         if biome.step_size > 0.001:
-            ground_z = np.floor(raw_z / biome.step_size) * biome.step_size
+            ground_z = np.floor(raw_z_block / biome.step_size) * biome.step_size
         else:
-            ground_z = raw_z
+            ground_z = raw_z_block
 
-        pos_z = ground_z + (sz / 2.0) - 1.0
+        # 6c. Create and Position Block
+        # Center of box Z = ground_z + half height
+        # Note: If you want blocks slightly sunken to prevent bottom gaps, subtract 0.1
+        final_block_z = ground_z + (sz / 2.0) - 0.05 
         
         box = trimesh.creation.box(extents=(sx, sy, sz))
+        
+        # Transform
         transform = np.eye(4)
         rot_matrix = trimesh.transformations.rotation_matrix(rng.uniform(0, 2 * np.pi), [0, 0, 1])
         transform[:3, :3] = rot_matrix[:3, :3]
-        transform[:3, 3] = [pos_x, pos_y, pos_z]
+        transform[:3, 3] = [pos_x, pos_y, final_block_z]
+        
         box.apply_transform(transform)
         meshes_list.append(box)
 
-    origins = np.stack([spawn_x_flat, spawn_y_flat, spawn_z_final], axis=1)
-    MultiBiomeTerrainCfg.spawns_positions = torch.tensor(origins, device=device, dtype=torch.float32)
-    
+    # --- 7. FINALIZE ---
+    if len(spawn_origins_list) > 0:
+        MultiBiomeTerrainCfg.spawns_positions = torch.tensor(spawn_origins_list, device=device, dtype=torch.float32)
+    else:
+        # Fallback if map is tiny
+        MultiBiomeTerrainCfg.spawns_positions = torch.zeros((1,3), device=device)
+
     return meshes_list, np.zeros(3)
 
 @configclass
@@ -238,7 +216,7 @@ class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
     terrain_height: float = 5.0 # needs to be high enough for noise range 
 
     # --- Terrain Shape (The Geometry) ---
-    noise_seed: int = 1234
+    noise_seed: int = 123
     noise_scale: float = 0.05       # Frequency of the Perlin noise (higher = more hills/valleys)
     noise_height_scale: float = 2.5 # Amplitude of the Perlin noise
     noise_octaves: int = 5

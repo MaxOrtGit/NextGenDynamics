@@ -28,7 +28,7 @@ damping_mod = 1
 # PLA/plastic ~ 1200, Aluminum ~ 2700, Steel ~ 7850
 body_density = 4000.0
 leg_density = 1000.0
-foot_density = 0.0
+foot_density = 500.0
 
 # Turn first 3 limits to radians
 hip_info = list(np.radians(hip_info[0:3])) + \

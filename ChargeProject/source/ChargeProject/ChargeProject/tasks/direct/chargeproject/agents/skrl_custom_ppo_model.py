@@ -34,7 +34,8 @@ class HeightMapEncoder(nn.Module):
             nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), # 6x6 -> 3x3, 288
             nn.BatchNorm2d(32),
             nn.ELU(),
-            nn.Flatten(), # 32 * 3 * 3 = 288
+            nn.Flatten(),
+            nn.Linear(32 * 3 * 3, 128),
         )
 
     def forward(self, x):
@@ -58,7 +59,8 @@ class NavigationMapEncoder(nn.Module):
             nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1), # 4x4 -> 2x2, 256
             nn.BatchNorm2d(64),
             nn.ELU(),
-            nn.Flatten(), # 64 * 2 * 2 = 256
+            nn.Flatten(),
+            nn.Linear(64 * 2 * 2, 128),
         )
 
     def forward(self, x):
@@ -117,12 +119,12 @@ class SharedRecurrentModel(GaussianMixin, DeterministicMixin, Model):
 
         # For fusion of both encoders
         self.fusion = nn.Sequential(
-            nn.Linear(128+288+256, 512),
+            nn.Linear(128+128+128, 256),
             nn.ELU(),
         )
 
         self.num_layers = 1
-        self.input_size = 512
+        self.input_size = 256
         self.hidden_size = 256
         self.sequence_length = 64
         self.gru = nn.GRU(
@@ -133,13 +135,13 @@ class SharedRecurrentModel(GaussianMixin, DeterministicMixin, Model):
 
         self.net = nn.Sequential(
             nn.ELU(),
-            nn.Linear(256, 128),  # <-- Add this projection layer
+            nn.Linear(256, 128),
             nn.ELU()
-        )# check if end with relu
+        )
 
         self.policy_layer = nn.Linear(128, act_dim)
         self.value_layer = nn.Linear(128, 1)
-        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=init_log_std), requires_grad=True)
+        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=float(init_log_std)), requires_grad=True)
 
         self._shared_output = None
         
@@ -187,7 +189,7 @@ class SharedRecurrentModel(GaussianMixin, DeterministicMixin, Model):
             # LSTM
             #rnn_output, rnn_dict = self.lstm_rollout(self.lstm, fused, terminated, inputs["rnn"])
             # GRU
-            rnn_output, rnn_dict = self.gru_rollout_no_term(self.gru, fused, terminated, inputs["rnn"])
+            rnn_output, rnn_dict = self.gru_rollout(self.gru, fused, terminated, inputs["rnn"])
 
             # Final layers
             net = self.net(rnn_output)

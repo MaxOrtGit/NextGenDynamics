@@ -108,8 +108,8 @@
       <geometry><sphere radius="0.01767766952966369"/></geometry>
     </collision>
     <inertial>
-      <mass value="0.000000"/>
-      <inertia ixx="0.000000e+00" iyy="0.000000e+00" izz="0.000000e+00" ixy="0" ixz="0" iyz="0"/>
+      <mass value="0.011570"/>
+      <inertia ixx="1.446251e-06" iyy="1.446251e-06" izz="1.446251e-06" ixy="0" ixz="0" iyz="0"/>
     </inertial>
   </link>
   <joint name="joint_leg_lower_foot_0" type="revolute">
@@ -213,8 +213,8 @@
       <geometry><sphere radius="0.01767766952966369"/></geometry>
     </collision>
     <inertial>
-      <mass value="0.000000"/>
-      <inertia ixx="0.000000e+00" iyy="0.000000e+00" izz="0.000000e+00" ixy="0" ixz="0" iyz="0"/>
+      <mass value="0.011570"/>
+      <inertia ixx="1.446251e-06" iyy="1.446251e-06" izz="1.446251e-06" ixy="0" ixz="0" iyz="0"/>
     </inertial>
   </link>
   <joint name="joint_leg_lower_foot_1" type="revolute">
@@ -318,8 +318,8 @@
       <geometry><sphere radius="0.01767766952966369"/></geometry>
     </collision>
     <inertial>
-      <mass value="0.000000"/>
-      <inertia ixx="0.000000e+00" iyy="0.000000e+00" izz="0.000000e+00" ixy="0" ixz="0" iyz="0"/>
+      <mass value="0.011570"/>
+      <inertia ixx="1.446251e-06" iyy="1.446251e-06" izz="1.446251e-06" ixy="0" ixz="0" iyz="0"/>
     </inertial>
   </link>
   <joint name="joint_leg_lower_foot_2" type="revolute">
@@ -423,8 +423,8 @@
       <geometry><sphere radius="0.01767766952966369"/></geometry>
     </collision>
     <inertial>
-      <mass value="0.000000"/>
-      <inertia ixx="0.000000e+00" iyy="0.000000e+00" izz="0.000000e+00" ixy="0" ixz="0" iyz="0"/>
+      <mass value="0.011570"/>
+      <inertia ixx="1.446251e-06" iyy="1.446251e-06" izz="1.446251e-06" ixy="0" ixz="0" iyz="0"/>
     </inertial>
   </link>
   <joint name="joint_leg_lower_foot_3" type="revolute">
@@ -528,8 +528,8 @@
       <geometry><sphere radius="0.01767766952966369"/></geometry>
     </collision>
     <inertial>
-      <mass value="0.000000"/>
-      <inertia ixx="0.000000e+00" iyy="0.000000e+00" izz="0.000000e+00" ixy="0" ixz="0" iyz="0"/>
+      <mass value="0.011570"/>
+      <inertia ixx="1.446251e-06" iyy="1.446251e-06" izz="1.446251e-06" ixy="0" ixz="0" iyz="0"/>
     </inertial>
   </link>
   <joint name="joint_leg_lower_foot_4" type="revolute">
@@ -633,8 +633,8 @@
       <geometry><sphere radius="0.01767766952966369"/></geometry>
     </collision>
     <inertial>
-      <mass value="0.000000"/>
-      <inertia ixx="0.000000e+00" iyy="0.000000e+00" izz="0.000000e+00" ixy="0" ixz="0" iyz="0"/>
+      <mass value="0.011570"/>
+      <inertia ixx="1.446251e-06" iyy="1.446251e-06" izz="1.446251e-06" ixy="0" ixz="0" iyz="0"/>
     </inertial>
   </link>
   <joint name="joint_leg_lower_foot_5" type="revolute">

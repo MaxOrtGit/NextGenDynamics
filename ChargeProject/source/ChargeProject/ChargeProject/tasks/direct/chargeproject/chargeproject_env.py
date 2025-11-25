@@ -168,12 +168,15 @@ class ChargeprojectEnv(DirectRLEnv):
         self.feet_step_up_counters = self.cfg.feet_step_time_leeway * torch.ones(self.num_envs, len(self.feet_body_ids), device=self.device)
         self.feet_step_down_counters = self.cfg.feet_step_time_leeway * torch.ones(self.num_envs, len(self.feet_body_ids), device=self.device)
 
+
+        self.avg_vel_b = torch.zeros(self.num_envs, 2, device=self.device)
+        self.vel_smoothing_alpha = 0.05 # ~20 steps
+
         # State of robot (patrol, attack, hide, search)
         self.robot_state = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
 
         # Different for each state
         self.state_timers = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-
 
         self._prev_total_staleness = torch.zeros(self.num_envs, device=self.device)
 
@@ -186,6 +189,7 @@ class ChargeprojectEnv(DirectRLEnv):
         os.makedirs(log_dir, exist_ok=True)
 
         self.extras["log"] = dict()
+        
 
 
         # Save env and config code for reproducibility
@@ -270,9 +274,69 @@ class ChargeprojectEnv(DirectRLEnv):
             self.loco_height_data = loco_map
             self._visualize_markers()
 
+    def _set_debug_actions(self) -> None:
+        # --- MANUAL GAIT TEST MODE (Corrected) ---
+        
+        # 1. Setup Timing
+        # Lower frequency slightly to make it easier to see individual leg movement
+        freq = 3.0 
+        t = self.common_step_counter * self.step_dt
+        phase = t * freq * 2 * torch.pi
+
+        # 2. Define Gait Parameters
+        swing_amp = 0.5   # Swing forward/back
+        lift_amp = 0.4    # Lift height
+        
+        # 3. Create Base Target from the ROBOT'S internal default, not our cached version.
+        # This ensures 'find_joints' indices match this tensor perfectly.
+        target_pos = self._robot.data.default_joint_pos.clone()
+
+        # 4. Calculate Signals
+        # Signal A: 1 to -1
+        sig_A = torch.sin(torch.tensor(phase, device=self.device))
+        # Signal B: Opposite of A
+        sig_B = -sig_A
+        
+        # Lift Signal (Only lift when swinging forward)
+        lift_sig_A = torch.clamp(torch.sin(torch.tensor(phase, device=self.device)), min=0)
+        lift_sig_B = torch.clamp(torch.sin(torch.tensor(phase + torch.pi, device=self.device)), min=0)
+
+        # 5. Define Groups
+        legs_A = [0, 2, 4]
+        legs_B = [1, 3, 5]
+
+        # 6. Apply to Joints using String Searching
+        for i in range(6):
+            # Construct the specific joint names for this leg number
+            hip_name = f"joint_body_leg_hip_{i}"
+            upper_name = f"joint_leg_hip_leg_upper_{i}"
+            
+            # SEARCH for the index. 
+            # find_joints returns ([indices], [names]). We take the first index.
+            # This is slower than caching, but guarantees we hit the right joint.
+            hip_ids, _ = self._robot.find_joints(hip_name)
+            upper_ids, _ = self._robot.find_joints(upper_name)
+            
+            hip_idx = hip_ids[0]
+            upper_idx = upper_ids[0]
+
+            if i in legs_A:
+                # Group A Logic
+                target_pos[:, hip_idx] += swing_amp * sig_A
+                target_pos[:, upper_idx] += lift_amp * lift_sig_A
+                
+            elif i in legs_B:
+                # Group B Logic (Explicitly used now)
+                target_pos[:, hip_idx] += swing_amp * sig_B
+                target_pos[:, upper_idx] += lift_amp * lift_sig_B
+
+        # 7. Send to Robot
+        # We pass the full tensor, so we don't need to specify joint_ids
+        self.processed_actions = target_pos
+        self._robot.set_joint_position_target(self.processed_actions)
 
     def _apply_action(self) -> None:
-        normalized_actions = self._actions.view(self._actions.shape[0], -1)
+        normalized_actions = self._actions.view(self._actions.shape[0], -1) * self.cfg.action_scale
 
         # For positive actions (0 to 1), scale by the positive range
         # For negative actions (-1 to 0), scale by the negative range
@@ -280,6 +344,41 @@ class ChargeprojectEnv(DirectRLEnv):
 
         # Calculate the final joint positions
         self.processed_actions = self.dof_default_pos + normalized_actions * action_range
+        
+        """
+        hip_joint = self.dof_idx.index(self._robot.find_joints("joint_body_leg_hip_1")[0][0])
+        upper_joint = self.dof_idx.index(self._robot.find_joints("joint_leg_hip_leg_upper_1")[0][0])
+        middle_joint = self.dof_idx.index(self._robot.find_joints("joint_leg_upper_leg_middle_1")[0][0])
+        lower_joint = self.dof_idx.index(self._robot.find_joints("joint_leg_middle_leg_lower_1")[0][0])
+        
+        if self.common_step_counter <= 125:
+            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
+            # move the hip joint back
+            self.processed_actions[:, upper_joint] += 3
+        else:#elif self.common_step_counter <= 200:
+            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
+            # Slam the leg down
+            self.processed_actions[:, upper_joint] -= 3
+        """
+        """   
+        lower_joint_ids = self._robot.find_joints("joint_leg_middle_leg_lower_.*")[0]
+        
+        if self.common_step_counter % 500 <= 100:
+            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
+            self.processed_actions[:, lower_joint_ids] -= 1
+            #even_joints = self._robot.find_joints(".*0.*|.*2.*|.*4.*")[0]
+            #even_joints = [j for j in even_joints if j in self.dof_idx]
+            #self.processed_actions[:, even_joints] = 0
+        elif self.common_step_counter % 500 <= 200:
+            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
+        elif self.common_step_counter % 500 <= 300:
+            self.processed_actions = 0
+        elif self.common_step_counter % 500 <= 400:
+            self.processed_actions = -self._robot.data.default_joint_pos[:, self.dof_idx]
+        else:
+            self.processed_actions = -self._robot.data.default_joint_pos[:, self.dof_idx]
+            self.processed_actions[:, lower_joint_ids] += 1
+        """
 
         self._robot.set_joint_position_target(self.processed_actions, joint_ids=self.dof_idx)
     
@@ -334,6 +433,8 @@ class ChargeprojectEnv(DirectRLEnv):
                 self._robot.data.joint_vel[:, self.dof_idx],
                 self._actions,
                 self.is_contact[:, self.feet_contact_ids].float(),
+                # Where it was moving
+                self.avg_vel_b,
 
                 # Player relative position
                # self._player.data.root_pos_w - self._robot.data.root_pos_w,
@@ -349,6 +450,7 @@ class ChargeprojectEnv(DirectRLEnv):
             "height_data": height_data.view(self.num_envs, self.cfg.loco_dim, self.cfg.loco_dim),
             "nav_data": nav_data,
         }
+        
         # Need to clone because of torch.compile
         observations = {"policy": observations}# for rl_games, "critic": observations.clone()}
         return observations
@@ -406,9 +508,9 @@ class ChargeprojectEnv(DirectRLEnv):
 
         # undesired contacts
         undesired_contacts = torch.sum(self.is_contact[:, self.undesired_contact_ids], dim=1)
-        undesired_contact_time = torch.sum(
-            self._contact_sensor.data.current_contact_time[:, self.undesired_contact_ids]
-        , dim=1)
+        #undesired_contact_time = torch.sum(
+        #    self._contact_sensor.data.current_contact_time[:, self.undesired_contact_ids]
+        #, dim=1)
         # If 3 or more feet are in contact, consider it stable
         #stable_contact = (torch.sum(self.is_contact[:, self.feet_contact_ids], dim=1) >= self.cfg.stable_contact_feet).float()
 
@@ -535,14 +637,28 @@ class ChargeprojectEnv(DirectRLEnv):
         excess_dist = torch.clamp(dist - self.cfg.patrol_size, min=0.0)
         boundary_penalty = torch.square(excess_dist)
 
-        velocity_matching = torch.square(torch.linalg.norm(self._robot.data.root_lin_vel_b[:, :2]) - self.cfg.patrol_target_velocity)
+        # 1. Update the Moving Average
+        # We use Body Frame velocity (b) because we want it to commit to a direction relative to itself
+        current_vel_xy = self._robot.data.root_lin_vel_b[:, :2]
+        
+        # Update equation: New_Avg = (Alpha * Current) + ((1-Alpha) * Old_Avg)
+        self.avg_vel_b = (self.vel_smoothing_alpha * current_vel_xy) + \
+                         ((1.0 - self.vel_smoothing_alpha) * self.avg_vel_b)
+
+        # 2. Calculate Reward based on the SMOOTHED velocity
+        # If it vibrates (+1, -1), avg_vel_b becomes ~0. Reward is low.
+        # If it walks (+1, +1), avg_vel_b becomes ~1. Reward is high.
+        avg_speed = torch.linalg.norm(self.avg_vel_b, dim=1)
+        
+        # Use the average speed for the penalty calculation instead of instantaneous
+        velocity_matching = torch.square(avg_speed - self.cfg.patrol_target_velocity)
 
         rewards = {
             # Patrol specific rewards
-            "patrol_exploration_reward": patrol_mask * exploration_reward * self.cfg.exploration_reward_scale * self.step_dt,
+            "patrol_exploration_reward": patrol_mask * exploration_reward * self.cfg.patrol_exploration_reward_scale * self.step_dt,
             "patrol_boundary_penalty": patrol_mask * boundary_penalty * self.cfg.patrol_boundary_penalty_scale * self.step_dt,
             "patrol_velocity_matching": patrol_mask * velocity_matching * self.cfg.patrol_velocity_matching_penalty_scale * self.step_dt,
-            
+
             "reach_target_reward": target_reward * self.cfg.reach_target_reward_scale * self.step_dt,
             "death_penalty": death_penalty * self.cfg.death_penalty_scale * self.step_dt,
             #"movement_reward": movement_reward * self.cfg.movement_reward_scale * self.step_dt,
@@ -555,13 +671,13 @@ class ChargeprojectEnv(DirectRLEnv):
             "feet_air_time": feet_air_time * self.cfg.feet_air_time_reward_scale * self.step_dt,
             #"feet_ground_time": feet_ground_time * self.cfg.feet_ground_time_reward_scale * self.step_dt,
             "undesired_contacts": undesired_contacts * self.cfg.undesired_contact_reward_scale * self.step_dt,
-            "undesired_contact_time": undesired_contact_time * self.cfg.undesired_contact_time_reward_scale * self.step_dt,
+            #"undesired_contact_time": undesired_contact_time * self.cfg.undesired_contact_time_reward_scale * self.step_dt,
             #"desired_contacts": stable_contact * self.cfg.desired_contact_reward_scale * self.step_dt,
             "flat_orientation_l2": flat_orientation * self.cfg.flat_orientation_reward_scale * self.step_dt,
             #"body_height_reward": body_height_reward * self.cfg.body_height_reward_scale * self.step_dt,
             #"lower_leg_reward": lower_leg_reward * self.cfg.lower_leg_reward_scale * self.step_dt,
             "hip_penalty": hip_penalty * self.cfg.hip_penalty_scale * self.step_dt,
-            "feet_under_body_penalty": feet_under_body_penalty * self.cfg.feet_under_body_penalty_scale * self.step_dt,
+            #"feet_under_body_penalty": feet_under_body_penalty * self.cfg.feet_under_body_penalty_scale * self.step_dt,
             #"step_reward": step_reward * self.cfg.step_reward_scale * self.step_dt,
             #"step_length_penalty": step_length_penalty * self.cfg.step_length_penalty_scale * self.step_dt,
             #"grounded_length_penalty": grounded_length_penalty * self.cfg.grounded_length_penalty_scale * self.step_dt,
@@ -660,6 +776,7 @@ class ChargeprojectEnv(DirectRLEnv):
 
         # Reset MapManager data
         self.map_manager.reset(env_ids)
+        self.avg_vel_b[env_ids] = 0.0
         
         #if len(env_ids) == self.num_envs:
             # For initial randomize the initial timeout
