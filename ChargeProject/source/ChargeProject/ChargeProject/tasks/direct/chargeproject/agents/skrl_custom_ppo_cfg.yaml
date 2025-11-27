@@ -8,7 +8,7 @@ seed: 42
 
 # Model defined in skrl_custom_ppo_model.py
 model:
-  log_std_init: -1.0 #-2.5
+  log_std_init: 0.0 #-2.5
   #gain: 0.7
 
 
@@ -23,16 +23,16 @@ model:
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html
 agent:
   #class: PPO
-  rollouts: 64
-  learning_epochs: 3
-  mini_batches: 32
+  rollouts: 24
+  learning_epochs: 5
+  mini_batches: 4
   discount_factor: 0.99
   lambda: 0.95
-  learning_rate: 1.0e-04
+  learning_rate: 1.0e-03
   # Can be changed in config
   #learning_rate_scheduler: KLAdaptiveLR
-  #learning_rate_scheduler_kwargs:
-  #  kl_threshold: 0.05
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.01
   state_preprocessor: null
   state_preprocessor_kwargs: null
   value_preprocessor: RunningStandardScaler

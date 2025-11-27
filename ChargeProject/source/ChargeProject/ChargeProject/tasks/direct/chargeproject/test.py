@@ -55,8 +55,6 @@ class SharedModel(GaussianMixin,DeterministicMixin, Model):
         )
         DeterministicMixin.__init__(self, clip_actions=False, role="value")
 
-        self.rnn_container = nn.Sequential(
-        )
         self.net_container = nn.Sequential(
             nn.LazyLinear(out_features=512),
             nn.ELU(),
@@ -79,8 +77,7 @@ class SharedModel(GaussianMixin,DeterministicMixin, Model):
         if role == "policy":
             states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
             taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-            rnn = self.rnn_container(states)
-            net = self.net_container(rnn)
+            net = self.net_container(states)
             self._shared_output = net
             output = self.policy_layer(net)
             return output, self.log_std_parameter, {}
@@ -88,15 +85,13 @@ class SharedModel(GaussianMixin,DeterministicMixin, Model):
             if self._shared_output is None:
                 states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
                 taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-                rnn = self.rnn_container(states)
-                shared_output = net
-                shared_output = net
-                shared_output = net
+                net = self.net_container(states)
                 shared_output = net
             else:
                 shared_output = self._shared_output
             self._shared_output = None
             output = self.value_layer(shared_output)
             return output, {}
+
 
 """

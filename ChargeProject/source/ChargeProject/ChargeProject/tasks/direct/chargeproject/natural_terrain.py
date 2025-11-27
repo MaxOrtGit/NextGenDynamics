@@ -218,7 +218,7 @@ class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
     # --- Terrain Shape (The Geometry) ---
     noise_seed: int = 123
     noise_scale: float = 0.05       # Frequency of the Perlin noise (higher = more hills/valleys)
-    noise_height_scale: float = 2.5 # Amplitude of the Perlin noise
+    noise_height_scale: float = 2.0 # Amplitude of the Perlin noise
     noise_octaves: int = 5
     noise_persistence: float = 0.5
     noise_lacunarity: float = 2.0
@@ -229,11 +229,11 @@ class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
     # --- THE BIOME LIST ---
     biomes: List[BiomeCfg] = field(default_factory=lambda: [
         BiomeCfg(weight=1.1, step_size=0.0), # Smooth
+        BiomeCfg(weight=1.0, step_size=0.0),
         BiomeCfg(weight=1.0, step_size=0.05),
-        BiomeCfg(weight=1.0, step_size=0.1),
-        BiomeCfg(weight=0.9, step_size=0.2),
+        BiomeCfg(weight=0.9, step_size=0.1),
         #BiomeCfg(weight=0.8, step_size=0.3),
-        BiomeCfg(weight=0.7, step_size=0.3), # Giant cliffs
+        BiomeCfg(weight=0.7, step_size=0.2), # Giant cliffs
     ])
 
     # --- Objects ---

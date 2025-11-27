@@ -48,6 +48,36 @@ SIMPLER_ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
     },
 )
 
+ANYMAL_JOINT_INFO = { 
+    "default_pos": {
+        ".*HAA": 0.0,
+        ".*F_HFE": 0.4,
+        ".*H_HFE": -0.4,
+        ".*F_KFE": -0.8,
+        ".*H_KFE": 0.8,
+    },
+    "limit_min": {
+        # Left side HAA limits (LF_HAA, LH_HAA)
+        ".*L._HAA": -0.72, 
+        # Right side HAA limits (RF_HAA, RH_HAA)
+        ".*R._HAA": -0.49,
+        # Hip Flexion/Extension (All legs)
+        ".*HFE": -1.5, #-9.42477796077,
+        # Knee Flexion/Extension (All legs)
+        ".*KFE": -2.5, #-9.42477796077,
+    },
+    "limit_max": {
+        # Left side HAA limits (LF_HAA, LH_HAA)
+        ".*L._HAA": 0.49,
+        # Right side HAA limits (RF_HAA, RH_HAA)
+        ".*R._HAA": 0.72,
+        # Hip Flexion/Extension (All legs)
+        ".*HFE": 1.5, #9.42477796077,
+        # Knee Flexion/Extension (All legs)
+        ".*KFE": -0.1, #9.42477796077,
+    },
+}
+
 
 @configclass
 class ChargeprojectEnvCfg(DirectRLEnvCfg):
@@ -59,22 +89,20 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     log = True
 
     # env
-    episode_length_s = 60.0
+    episode_length_s = 20.0
     # - spaces definition
-    action_space = 24
-    observation_space = spaces.Dict({
-        "observations": spaces.Box(-math.inf, math.inf, shape=(97,), dtype=float),
+    action_space = 12 #24
+    """
+    observation_space_old = spaces.Dict({
+        "observations": spaces.Box(-math.inf, math.inf, shape=(97 - 2 - 12*3 - 4 + 3,), dtype=float),
         "height_data": spaces.Box(-math.inf, math.inf, shape=(25, 25), dtype=float),
         "nav_data": spaces.Box(-math.inf, math.inf, shape=(3, 33, 33), dtype=float)
-    })
-    """
-    action_space = spaces.Box(-math.inf, math.inf, shape=(6, 4), dtype=float)
+    })"""
     observation_space = spaces.Dict({
-        "base_obs": spaces.Box(-math.inf, math.inf, shape=(33, ), dtype=float),
-        "leg_obs": spaces.Box(-math.inf, math.inf, shape=(6, 33), dtype=float),
-        "height_data": spaces.Box(-math.inf, math.inf, shape=(16, 16), dtype=float)
+        "observations": spaces.Box(-math.inf, math.inf, shape=(48,), dtype=float),
+        "height_data": spaces.Box(-math.inf, math.inf, shape=(25, 25), dtype=float),
+        #"nav_data": spaces.Box(-math.inf, math.inf, shape=(3, 33, 33), dtype=float)
     })
-    """
     state_space = 0 #idk why this is here
 
     # simulation
@@ -92,15 +120,23 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     )
     # robot(s)
     robot: ArticulationCfg = SPIDER_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    robot: ArticulationCfg = ANYMAL_C_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     
     # Spider Robot (base, leg_hip_i, leg_middle_i, leg_lower_i, leg_foot_i)
-    base_name = "body"
-    foot_names = "leg_foot_.*"
-    undesired_contact_body_names = "body|leg_upper_.*|leg_middle_.*|leg_lower_.*"
-    middle_leg_joint_names = "joint_leg_upper_leg_middle_.*"
-    lower_leg_names = "leg_lower_.*"
-    lower_leg_joint_names = "joint_leg_middle_leg_lower_.*"
-    hip_joint_names = "joint_body_leg_hip_.*"
+    #base_name = "body"
+    #foot_names = "leg_foot_.*"
+    #undesired_contact_body_names = "body|leg_upper_.*|leg_middle_.*|leg_lower_.*"
+    #lower_leg_names = "leg_lower_.*"
+    #lower_leg_joint_names = "joint_leg_middle_leg_lower_.*"
+    #hip_joint_names = "joint_body_leg_hip_.*"
+    #legs = 6
+
+    # Anymal Robot
+    base_name = "base"
+    foot_names = ".*FOOT"
+    undesired_contact_body_names = ".*THIGH"
+    legs = 4
+    
 
     
     player: RigidObjectCfg = RigidObjectCfg(
@@ -148,7 +184,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
-        terrain_generator=terrain_gen_cfg, # SIMPLER_ROUGH_TERRAINS_CFG,
+        terrain_generator=ROUGH_TERRAINS_CFG #terrain_gen_cfg, # SIMPLER_ROUGH_TERRAINS_CFG,
         max_init_terrain_level=9,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -172,12 +208,22 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
         ray_alignment="base",
         max_distance=50.0,
         pattern_cfg=patterns.LidarPatternCfg(
-            horizontal_fov_range=(0, 360), # Full 360-degree sweep
+            horizontal_fov_range=(-180.0, 180.0), # Full 360-degree sweep
             vertical_fov_range=(-40, 40),  # Looks 40 deg up and 40 deg down
-            horizontal_res=5,              # 
-            channels=int((40+1+40)/2),     # ring every 2 deg vertically
+            horizontal_res=2.5,            # 
+            channels=1 + int((40+40)/2.5),   # ring every 2.5 deg vertically
         ),
         debug_vis=visualize_nav_data, 
+        mesh_prim_paths=["/World/ground"],
+    )
+    
+    # we add a height scanner for perceptive locomotion
+    height_scanner = RayCasterCfg(
+        prim_path="/World/envs/env_.*/Robot/base",
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[2.4, 2.4]),
+        debug_vis=False,
         mesh_prim_paths=["/World/ground"],
     )
     
@@ -189,6 +235,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     patrol_size = 32.0 # Meters (Area the robot is expected to search)
     staleness_res = 0.5 # Meters (Resolution of staleness map)
     staleness_dim = int(patrol_size / staleness_res) # 64 pixels
+    staleness_decay_rate = 1/30 # 30 seconds from clean to fully stale
 
     nav_size = 24.0
     nav_dim = 33 # must line up with model input size
@@ -198,11 +245,11 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     loco_size = 2.4
     loco_dim = 25 # must line up with model input size
     height_res = 0.1 # must be size / (dim - 1)
-
+    
     marker_colors = 57
 
     # Final rewards
-    action_scale = 0.5
+    action_scale = 1.0
     
 
     # Training stages:
@@ -243,52 +290,54 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     patrol_boundary_penalty_scale = -10.0
     patrol_velocity_matching_penalty_scale = -0.25
     patrol_target_velocity = 1.0 # m/s
+    lin_vel_reward_scale = 1.0
+    yaw_rate_reward_scale = 0.5
 
     # Multiplied by targets hit reward
-    reach_target_reward_scale = 1000 * 4 # == add * 4
-    death_penalty_scale = -200
-    movement_reward_scale = 30 / 6 / 2 * 2 # -- add / 6 # ---- add / 2 # = add * 2
+    #reach_target_reward_scale = 1000 * 4 # == add * 4
+    death_penalty_scale = -20
+    #movement_reward_scale = 30 / 6 / 2 * 2 # -- add / 6 # ---- add / 2 # = add * 2
     z_vel_reward_scale = -2.0 
     ang_vel_reward_scale = -0.05
 
-    joint_torque_reward_scale = -2.5e-5 / 2
-    joint_accel_reward_scale = -2.5e-7 / 2 / 150
-    dof_vel_reward_scale = 0.0
-    action_rate_reward_scale = -0.01 / 2
+    joint_torque_reward_scale = -2.5e-5# / 2
+    joint_accel_reward_scale = -2.5e-7# / 2 / 150
+    #dof_vel_reward_scale = 0.0
+    action_rate_reward_scale = -0.01# / 2
 
-    feet_air_time_reward_scale = 0.5 / 1.5
+    feet_air_time_reward_scale = 0.5# / 1.5
     feet_air_time_target = 0.5 # set to 0.4 after start (was 0.7 but not sure if this matters) # ---- set 0.35 # ----- set to 0.6
-    feet_ground_time_reward_scale = 40
-    feet_ground_time_target = 0.5 # set to 0.4 after start (was 0.7 but not sure if this matters) # ---- set 0.35 # ----- set to 0.6
+    #feet_ground_time_reward_scale = 40
+    #feet_ground_time_target = 0.5 # set to 0.4 after start (was 0.7 but not sure if this matters) # ---- set 0.35 # ----- set to 0.6
     
     undesired_contact_reward_scale = -1.0
     undesired_contact_time_reward_scale = -15
-    desired_contact_reward_scale = 10 * 4 / 8 # add (*4) after start ---- add / 8
-    stable_contact_feet = 2 # ---- set to 2 (was 3)
-    flat_orientation_reward_scale = -5.0
-    body_height_reward_scale = 114 / 2 / 2 # * 4 # Remove (*4) after init # add (/2) after start # ----- add / 2
-    lower_leg_reward_scale = 200 / 10 # add (/10) after start
-    hip_penalty_scale = 0#-30 / 5 # ---- Add / 5
-    feet_under_body_penalty_scale = -72000 * 2 / 8# add (*2) after start # == add / 8
-    body_penalty_radius = 0.175
+    #desired_contact_reward_scale = 10 * 4 / 8 # add (*4) after start ---- add / 8
+    #stable_contact_feet = 2 # ---- set to 2 (was 3)
+    flat_orientation_reward_scale = 0#-5.0
+    #body_height_reward_scale = 114 / 2 / 2 # * 4 # Remove (*4) after init # add (/2) after start # ----- add / 2
+    #lower_leg_reward_scale = 200 / 10 # add (/10) after start
+    #hip_penalty_scale = 0#-30 / 5 # ---- Add / 5
+    #feet_under_body_penalty_scale = -72000 * 2 / 8# add (*2) after start # == add / 8
+    #body_penalty_radius = 0.175
 
     # rewards positive joint velocity when time from contact
-    step_reward_scale = 50 / 4 / 4 / 2# Set 50 after init (from 0) # Add (*4) after start # -- remove *4 #--- add / 4 # ---- add / 4
-    step_up_time_end = 0.3 # set to 0.2 after start (was 0.55)  # ----- set to 0.3
+    #step_reward_scale = 50 / 4 / 4 / 2# Set 50 after init (from 0) # Add (*4) after start # -- remove *4 #--- add / 4 # ---- add / 4
+    #step_up_time_end = 0.3 # set to 0.2 after start (was 0.55)  # ----- set to 0.3
     # linear scale of penalty if leg doesn't step in this time
-    step_length_penalty_scale = -15
-    step_penalty_start = 1.3
-    step_penalty_cap = 2.0
-    grounded_length_penalty_scale = -15
-    grounded_penalty_start = 2.0
-    grounded_penalty_cap = 2.0
-    feet_up_step_time_penalty_scale = -160 * 2 / 3 # set -60 after start (from 0) # -- set -160  # ----- add * 2 # = / 3
-    feet_down_step_time_penalty_scale = -160 * 2 / 3 # set -60 after start (from 0) # -- set -160 # ----- add * 2 # = / 3
-    feet_step_time_multiplier = 1.5 * 2 # makes more going up than being on ground # == add * 2
-    feet_step_time_target = 0.4
-    feet_step_time_leeway = 2.0 # clamped out on positive  # ----- set to 0.8 # = set to 2.0
+    #step_length_penalty_scale = -15
+    #step_penalty_start = 1.3
+    #step_penalty_cap = 2.0
+    #grounded_length_penalty_scale = -15
+    #grounded_penalty_start = 2.0
+    #grounded_penalty_cap = 2.0
+    #feet_up_step_time_penalty_scale = -160 * 2 / 3 # set -60 after start (from 0) # -- set -160  # ----- add * 2 # = / 3
+    #feet_down_step_time_penalty_scale = -160 * 2 / 3 # set -60 after start (from 0) # -- set -160 # ----- add * 2 # = / 3
+    #feet_step_time_multiplier = 1.5 * 2 # makes more going up than being on ground # == add * 2
+    #feet_step_time_target = 0.4
+    #feet_step_time_leeway = 2.0 # clamped out on positive  # ----- set to 0.8 # = set to 2.0
 
-    joint_default_penalty = 0
+    #joint_default_penalty = 0
 
 
     # --- State Machine Settings ---

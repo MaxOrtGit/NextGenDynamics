@@ -40,7 +40,7 @@ class MapManager:
         self.global_height_map = self._scan_entire_world(ground_prim_path)
         
         # Initialize per-env staleness (1.0 = Stale/Dusty)
-        self.staleness_maps = self.patrol_mask.repeat(self.num_envs, 1, 1, 1).clone()
+        self.staleness_maps = torch.zeros(self.num_envs, 1, self.config.staleness_dim, self.config.staleness_dim, device=device)
         
         # Pre-calculate 8 cardinal relative offsets (Radius = 12.0m)
         # Angles: 0 (Front), 45, 90 (Left), 135, 180 (Back), etc.
@@ -119,9 +119,9 @@ class MapManager:
         
         return height_map
 
-    def update(self, env_origins, robot_pos_w, robot_yaw_w, lidar_hits_w):
+    def update(self, env_origins, robot_pos_w, robot_yaw_w, lidar_hits_w, dt):
         # Update Staleness & Calculate Reward (Amount Cleared)
-        cleared_value = self._update_staleness_map(lidar_hits_w, env_origins)
+        cleared_value = self._update_staleness_map(lidar_hits_w, env_origins, dt)
 
         # Sample Far Sensors (8 Cardinal Directions)
         far_staleness = self._get_far_staleness(robot_pos_w, robot_yaw_w, env_origins)
@@ -131,9 +131,9 @@ class MapManager:
 
         return nav_map, loco_map, far_staleness, cleared_value
 
-    def _update_staleness_map(self, lidar_hits_w, env_origins):
+    def _update_staleness_map(self, lidar_hits_w, env_origins, dt):
         # Decay (Everything gets dusty)
-        self.staleness_maps += 0.01
+        self.staleness_maps += dt * self.config.staleness_decay_rate
         self.staleness_maps = torch.minimum(self.staleness_maps, self.patrol_mask)
         
         # Calculate hits relative to Env Origin

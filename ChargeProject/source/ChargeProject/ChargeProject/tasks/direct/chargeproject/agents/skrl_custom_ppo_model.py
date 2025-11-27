@@ -27,6 +27,95 @@ class HeightMapEncoder(nn.Module):
         super().__init__()
         
         self.net = nn.Sequential(
+            nn.Conv2d(input_channels + 2, 8, kernel_size=5, stride=2, padding=0), # 25x25 -> 11x11, 968
+            nn.ELU(),
+            nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=0), # 11x11 -> 5x5, 400
+            nn.ELU(),
+            nn.Conv2d(16, 16, kernel_size=2, stride=2, padding=0), # 5x5 -> 2x2, 64
+            nn.ELU(),
+            nn.Flatten(),
+        )
+
+    def forward(self, x):
+        batch_size, _,  h, w = x.shape
+        device = x.device
+        x_channel, y_channel = get_coordinate_grid(batch_size, h, w, device)
+        
+        return self.net(torch.cat([x, x_channel, y_channel], dim=1))
+
+class SharedRecurrentModel(GaussianMixin,DeterministicMixin, Model):
+    def __init__(self, observation_space, action_space, device):
+        Model.__init__(self, observation_space, action_space, device)
+        GaussianMixin.__init__(
+            self,
+            clip_actions=False,
+            clip_log_std=True,
+            min_log_std=-20.0,
+            max_log_std=2.0,
+            reduction="sum",
+            role="policy",
+        )
+        DeterministicMixin.__init__(self, clip_actions=False, role="value")
+        
+        self.height_encoder = HeightMapEncoder()
+        self.net_container = nn.Sequential(
+            nn.LazyLinear(out_features=512),
+            nn.ELU(),
+            nn.LazyLinear(out_features=256),
+            nn.ELU(),
+            nn.LazyLinear(out_features=128),
+            nn.ELU(),
+        )
+        self.policy_layer = nn.LazyLinear(out_features=self.num_actions)
+        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=0.0), requires_grad=True)
+        self.value_layer = nn.LazyLinear(out_features=1)
+
+        self._shared_output = None
+
+    def act(self, inputs, role):
+        if role == "policy":
+            return GaussianMixin.act(self, inputs, role)
+        elif role == "value":
+            return DeterministicMixin.act(self, inputs, role)
+
+    def compute(self, inputs, role=""):
+        if self._shared_output is None:
+            # height map now is in states["height_data"]
+            states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
+            height_out = self.height_encoder(states["height_data"].unsqueeze(1))
+            net = self.net_container(torch.concatenate([states["observations"], height_out], dim=1))
+            self._shared_output = net
+
+        if role == "policy":
+            output = self.policy_layer(self._shared_output)
+            return output, self.log_std_parameter, {}
+        elif role == "value":
+            output = self.value_layer(self._shared_output)
+            self._shared_output = None
+            return output, {}
+        
+"""
+def get_coordinate_grid(batch_size, h, w, device):
+    # --- Generate Coordinate Channels ---
+    # Create linear gradients from -1 to 1
+    x_range = torch.linspace(-1, 1, steps=w, device=device)
+    y_range = torch.linspace(-1, 1, steps=h, device=device)
+    
+    # Create meshgrid (Y, X)
+    # indexing='ij' means first dim is rows (Y), second is cols (X)
+    y_grid, x_grid = torch.meshgrid(y_range, x_range, indexing='ij')
+    
+    # Expand to batch size: (Batch, 1, H, W)
+    x_channel = x_grid.unsqueeze(0).unsqueeze(0).expand(batch_size, -1, -1, -1)
+    y_channel = y_grid.unsqueeze(0).unsqueeze(0).expand(batch_size, -1, -1, -1)
+
+    return x_channel, y_channel
+
+class HeightMapEncoder(nn.Module):
+    def __init__(self, input_channels=1):
+        super().__init__()
+        
+        self.net = nn.Sequential(
             nn.Conv2d(input_channels + 2, 8, kernel_size=3, stride=2, padding=0), # 25x25 -> 12x12, 1152
             nn.ELU(),
             nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1), # 12x12 -> 6x6, 576
@@ -197,7 +286,7 @@ class SharedRecurrentModel(GaussianMixin, DeterministicMixin, Model):
             self._shared_output = net, rnn_dict
 
         if role == "policy":
-            mean = torch.tanh(self.policy_layer(net))
+            mean = self.policy_layer(net)
             return mean, self.log_std_parameter, rnn_dict
 
         elif role == "value":
@@ -206,18 +295,6 @@ class SharedRecurrentModel(GaussianMixin, DeterministicMixin, Model):
             output = self.value_layer(net)
             return output, rnn_dict
 
-    
-    def gru_rollout_no_term(self, model, states, terminated, hidden_states):
-        #print(f"states shape: {states.shape}, hidden_states shapes: {[h.shape for h in hidden_states]}")
-        # evaluation mode: one step at a time
-        rnn_input = states.view(-1, 1, states.shape[-1])
-        # Make h contiguous
-        hidden_states[0] = hidden_states[0].contiguous()
-        rnn_output, hidden_states[0] = model(rnn_input, hidden_states[0])
-        # flatten batch + sequence
-        rnn_output = torch.flatten(rnn_output, start_dim=0, end_dim=1)
-
-        return rnn_output, {"rnn": hidden_states}
     
 
     def gru_rollout(self, model, states, terminated, hidden_states):
@@ -262,6 +339,18 @@ class SharedRecurrentModel(GaussianMixin, DeterministicMixin, Model):
 
         return rnn_output, {"rnn": hidden_states}
     
+    
+    def gru_rollout_no_term(self, model, states, terminated, hidden_states):
+        #print(f"states shape: {states.shape}, hidden_states shapes: {[h.shape for h in hidden_states]}")
+        # evaluation mode: one step at a time
+        rnn_input = states.view(-1, 1, states.shape[-1])
+        # Make h contiguous
+        hidden_states[0] = hidden_states[0].contiguous()
+        rnn_output, hidden_states[0] = model(rnn_input, hidden_states[0])
+        # flatten batch + sequence
+        rnn_output = torch.flatten(rnn_output, start_dim=0, end_dim=1)
+
+        return rnn_output, {"rnn": hidden_states}
     
     # === LSTM rollout logic ===
     def lstm_rollout(self, model, states, terminated, hidden_states):
@@ -314,3 +403,4 @@ class SharedRecurrentModel(GaussianMixin, DeterministicMixin, Model):
         rnn_output = torch.flatten(rnn_output, start_dim=0, end_dim=1)
 
         return rnn_output, {"rnn": hidden_states}
+"""

@@ -20,7 +20,7 @@ from .map_manager import MapManager
 from .spider_robot import SPIDER_JOINT_INFO
 from .natural_terrain import MultiBiomeTerrainCfg
 
-from .chargeproject_env_cfg import ChargeprojectEnvCfg
+from .chargeproject_env_cfg import ChargeprojectEnvCfg, ANYMAL_JOINT_INFO
 
 from isaaclab.markers.visualization_markers import VisualizationMarkersCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
@@ -138,13 +138,14 @@ class ChargeprojectEnv(DirectRLEnv):
         self.undesired_contact_ids, _ = self._contact_sensor.find_bodies(
             self.cfg.undesired_contact_body_names
         )
-        self.lower_leg_body_ids, _ = self._robot.find_bodies(self.cfg.lower_leg_names)
-        self.hip_joint_ids, _ = self._robot.find_joints(self.cfg.hip_joint_names)
-        self.feet_body_ids, _ = self._robot.find_bodies(self.cfg.foot_names)
+        #self.lower_leg_body_ids, _ = self._robot.find_bodies(self.cfg.lower_leg_names)
+        #self.hip_joint_ids, _ = self._robot.find_joints(self.cfg.hip_joint_names)
+        #self.feet_body_ids, _ = self._robot.find_bodies(self.cfg.foot_names)
         self.hip_body_ids = []
         self.leg_joint_ids = []
         self.feet_contact_ids = []
-        self.dof_idx = []
+        self.dof_idx, _ = self._robot.find_joints(".*")#[]
+        """
         for i in range(6):
             vals = []
             vals.append(self._robot.find_bodies(f".*hip_{i}")[0][0])
@@ -153,20 +154,39 @@ class ChargeprojectEnv(DirectRLEnv):
             vals.append(self._robot.find_bodies(f".*lower_{i}")[0][0])
             self.leg_joint_ids.append(vals)
             self.hip_body_ids.append(vals[0])
-            self.feet_contact_ids.append(self._contact_sensor.find_bodies(f".*foot_{i}")[0][0])
-            self.dof_idx.extend(vals)
-        
+            self.feet_contact_ids.append(self._contact_sensor.find_bodies(f"{self.cfg.foot_names}{i}")[0][0])
+            # WAIT THIS IS BAD self.dof_idx.extend(vals)
+        """
+        self.dof_min_limits = torch.zeros(len(self.dof_idx), device=self.device)
+        self.dof_max_limits = torch.zeros(len(self.dof_idx), device=self.device)
+        self.dof_default_pos = torch.zeros(len(self.dof_idx), device=self.device)
+
         # Get limits and default positions from SPIDER_JOINT_INFO
-        self.dof_min_limits = torch.tensor(list(SPIDER_JOINT_INFO["limit_min"].values()), device=self.device).repeat(6)
-        self.dof_max_limits = torch.tensor(list(SPIDER_JOINT_INFO["limit_max"].values()), device=self.device).repeat(6)
-        self.dof_default_pos = torch.tensor(list(SPIDER_JOINT_INFO["default_pos"].values()), device=self.device).repeat(6)
+        for name, value in ANYMAL_JOINT_INFO["limit_min"].items():
+            joint_ids, _ = self._robot.find_joints(name)
+            # get the index in dof_idx
+            for joint_id in joint_ids:
+                idx = self.dof_idx.index(joint_id)
+                self.dof_min_limits[idx] = value
+        for name, value in ANYMAL_JOINT_INFO["limit_max"].items():
+            joint_ids, _ = self._robot.find_joints(name)
+            # get the index in dof_idx
+            for joint_id in joint_ids:
+                idx = self.dof_idx.index(joint_id)
+                self.dof_max_limits[idx] = value
+        for name, value in ANYMAL_JOINT_INFO["default_pos"].items():
+            joint_ids, _ = self._robot.find_joints(name)
+            # get the index in dof_idx
+            for joint_id in joint_ids:
+                idx = self.dof_idx.index(joint_id)
+                self.dof_default_pos[idx] = value
 
         # Pre-calculate the range of motion on either side of the default position
         self.positive_range = self.dof_max_limits - self.dof_default_pos
         self.negative_range = self.dof_default_pos - self.dof_min_limits
         
-        self.feet_step_up_counters = self.cfg.feet_step_time_leeway * torch.ones(self.num_envs, len(self.feet_body_ids), device=self.device)
-        self.feet_step_down_counters = self.cfg.feet_step_time_leeway * torch.ones(self.num_envs, len(self.feet_body_ids), device=self.device)
+        #self.feet_step_up_counters = self.cfg.feet_step_time_leeway * torch.ones(self.num_envs, len(self.feet_body_ids), device=self.device)
+        #self.feet_step_down_counters = self.cfg.feet_step_time_leeway * torch.ones(self.num_envs, len(self.feet_body_ids), device=self.device)
 
 
         self.avg_vel_b = torch.zeros(self.num_envs, 2, device=self.device)
@@ -191,6 +211,8 @@ class ChargeprojectEnv(DirectRLEnv):
         self.extras["log"] = dict()
         
 
+        # X/Y linear velocity and yaw angular velocity commands
+        self._commands = torch.zeros(self.num_envs, 3, device=self.device)
 
         # Save env and config code for reproducibility
         current_file = inspect.getfile(inspect.currentframe())
@@ -209,14 +231,17 @@ class ChargeprojectEnv(DirectRLEnv):
         self.scene.articulations["robot"] = self._robot
         self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         self.scene.sensors["contact_sensor"] = self._contact_sensor
-
+        
+        # we add a height scanner for perceptive locomotion
+        self._height_scanner = RayCaster(self.cfg.height_scanner)
+        self.scene.sensors["height_scanner"] = self._height_scanner
         #self._player = RigidObject(self.cfg.player)
         
         #self.scene.rigid_objects["player"] = self._player
 
         # we add a height scanner for perceptive locomotion
-        self._lidar_sensor = RayCaster(self.cfg.lidar_scanner)
-        self.scene.sensors["lidar_scanner"] = self._lidar_sensor
+        #self._lidar_sensor = RayCaster(self.cfg.lidar_scanner)
+        #self.scene.sensors["lidar_scanner"] = self._lidar_sensor
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -259,7 +284,7 @@ class ChargeprojectEnv(DirectRLEnv):
         
         #self._update_player_movement()
         
-        if self.cfg.cameras and self.cfg.visualize_nav_data:
+        if self.cfg.cameras and self.cfg.visualize_nav_data and False:
             # Get data from MapManager
             # (Assuming you have robot_pos, robot_yaw, and lidar_hits)
             nav_map, loco_map, _, _ = self.map_manager.update(
@@ -336,14 +361,15 @@ class ChargeprojectEnv(DirectRLEnv):
         self._robot.set_joint_position_target(self.processed_actions)
 
     def _apply_action(self) -> None:
-        normalized_actions = self._actions.view(self._actions.shape[0], -1) * self.cfg.action_scale
+        normalized_actions = self._actions * self.cfg.action_scale
 
         # For positive actions (0 to 1), scale by the positive range
         # For negative actions (-1 to 0), scale by the negative range
-        action_range = torch.where(normalized_actions > 0, self.positive_range, self.negative_range)
+        #action_range = torch.where(normalized_actions > 0, self.positive_range, self.negative_range)
 
         # Calculate the final joint positions
-        self.processed_actions = self.dof_default_pos + normalized_actions * action_range
+        #self.processed_actions = self.dof_default_pos + normalized_actions * action_range
+        self.processed_actions = self._robot.data.default_joint_pos + normalized_actions
         
         """
         hip_joint = self.dof_idx.index(self._robot.find_joints("joint_body_leg_hip_1")[0][0])
@@ -398,6 +424,48 @@ class ChargeprojectEnv(DirectRLEnv):
 
 
     def _get_observations(self) -> dict:
+        
+        self._previous_actions = self._actions.clone()
+        
+        
+        #nav_data, height_data, far_staleness, self.last_exploration_bonus = self.map_manager.update(
+        #    self._get_origins(),
+        #    self._robot.data.root_pos_w,
+        #    self._robot.data.heading_w.unsqueeze(-1),
+        #    self._lidar_sensor.data.ray_hits_w,
+        #)
+
+        height_data = (
+            self._height_scanner.data.pos_w[:, 2].unsqueeze(1) - self._height_scanner.data.ray_hits_w[..., 2] - 0.5
+        ).clip(-1.0, 1.0).view(self.num_envs, 25, 25)
+
+        obs = torch.cat(
+            [
+                tensor
+                for tensor in (
+                    self._robot.data.root_lin_vel_b,
+                    self._robot.data.root_ang_vel_b,
+                    self._robot.data.projected_gravity_b,
+                    self._commands,
+                    self._robot.data.joint_pos - self._robot.data.default_joint_pos,
+                    self._robot.data.joint_vel,
+                    self._actions,
+                )
+                if tensor is not None
+            ],
+            dim=-1,
+        )
+
+        observations = {
+            "observations": obs,
+            "height_data": height_data,
+            #"nav_data": nav_data,
+        }
+
+        observations = {"policy": observations}# for rl_games, "critic": observations.clone()}
+
+        return observations
+        """
         self._previous_actions = self._actions.clone()
         
         net_contact_forces = self._contact_sensor.data.net_forces_w_history
@@ -428,6 +496,7 @@ class ChargeprojectEnv(DirectRLEnv):
                 self._robot.data.root_lin_vel_b,
                 self._robot.data.root_ang_vel_b,
                 self._robot.data.projected_gravity_b,
+                self._commands,
                 # Joint info
                 self._robot.data.joint_pos[:, self.dof_idx] - self._robot.data.default_joint_pos[:, self.dof_idx],
                 self._robot.data.joint_vel[:, self.dof_idx],
@@ -454,6 +523,7 @@ class ChargeprojectEnv(DirectRLEnv):
         # Need to clone because of torch.compile
         observations = {"policy": observations}# for rl_games, "critic": observations.clone()}
         return observations
+        """
 
 
     def _get_rewards(self) -> torch.Tensor:
@@ -496,7 +566,9 @@ class ChargeprojectEnv(DirectRLEnv):
             :, self.feet_contact_ids
         ]
         last_air_time = self._contact_sensor.data.last_air_time[:, self.feet_contact_ids]
-        feet_air_time = torch.sum((last_air_time - 0.5) * first_contact, dim=1)
+        feet_air_time = torch.sum((last_air_time - 0.5) * first_contact, dim=1) * (
+            torch.norm(self._commands[:, :2], dim=1) > 0.1
+        )
         
         #first_air = self._contact_sensor.compute_first_air(self.step_dt)[
         #    :, self.feet_contact_ids
@@ -506,7 +578,11 @@ class ChargeprojectEnv(DirectRLEnv):
         #feet_ground_time = torch.clamp(feet_ground_time, max=0)
 
         # undesired contacts
-        undesired_contacts = torch.sum(self.is_contact[:, self.undesired_contact_ids], dim=1)
+        net_contact_forces = self._contact_sensor.data.net_forces_w_history
+        is_contact = (
+            torch.max(torch.norm(net_contact_forces[:, :, self.undesired_contact_ids], dim=-1), dim=1)[0] > 1.0
+        )
+        undesired_contacts = torch.sum(is_contact, dim=1)
         #undesired_contact_time = torch.sum(
         #    self._contact_sensor.data.current_contact_time[:, self.undesired_contact_ids]
         #, dim=1)
@@ -544,25 +620,25 @@ class ChargeprojectEnv(DirectRLEnv):
 
 
         # Hip joint deviation from neutral (0)
-        hip_joint_positions = self._robot.data.joint_pos[:, self.hip_joint_ids]  # [envs, num_hips]
-        hip_deviation = torch.abs(hip_joint_positions)  # absolute deviation from 0
-        hip_penalty = torch.mean(hip_deviation, dim=1)
+        #hip_joint_positions = self._robot.data.joint_pos[:, self.hip_joint_ids]  # [envs, num_hips]
+        #hip_deviation = torch.abs(hip_joint_positions)  # absolute deviation from 0
+        #hip_penalty = torch.mean(hip_deviation, dim=1)
 
         # Feet under body penalty
-        base_pos_xy = self._robot.data.body_pos_w[:, self.base_body_ids, :2].squeeze(1) # [envs, 2]
-        feet_pos_xy = self._robot.data.body_pos_w[:, self.feet_body_ids, :2] # [envs, num_feet, 2]
+        #base_pos_xy = self._robot.data.body_pos_w[:, self.base_body_ids, :2].squeeze(1) # [envs, 2]
+        #feet_pos_xy = self._robot.data.body_pos_w[:, self.feet_body_ids, :2] # [envs, num_feet, 2]
 
         # Horizontal distance of each foot from body center
-        feet_dist_to_base = torch.linalg.norm(feet_pos_xy - base_pos_xy.unsqueeze(1), dim=2)  # [envs, num_feet]
+        #feet_dist_to_base = torch.linalg.norm(feet_pos_xy - base_pos_xy.unsqueeze(1), dim=2)  # [envs, num_feet]
 
         # Feet that are within the body cylinder
-        under_body_mask = feet_dist_to_base < self.cfg.body_penalty_radius
+        #under_body_mask = feet_dist_to_base < self.cfg.body_penalty_radius
 
         # Compute how deep they are inside (closer to center = higher penalty)
-        under_body_depth = torch.clamp(self.cfg.body_penalty_radius - feet_dist_to_base, min=0.0)
+        #under_body_depth = torch.clamp(self.cfg.body_penalty_radius - feet_dist_to_base, min=0.0)
 
         # Mean penalty per environment (across all feet)
-        feet_under_body_penalty = torch.mean(under_body_depth * under_body_mask.float(), dim=1)
+        #feet_under_body_penalty = torch.mean(under_body_depth * under_body_mask.float(), dim=1)
 
         """
         # Reward for stepping up/down
@@ -625,8 +701,8 @@ class ChargeprojectEnv(DirectRLEnv):
         """
         # TODO: instead of mask at end do math on specific states only
         # Patrol specific rewards
-        patrol_mask = (self.robot_state == RobotState.PATROL).float()
-        exploration_reward = self.last_exploration_bonus 
+        #patrol_mask = (self.robot_state == RobotState.PATROL).float()
+        #exploration_reward = self.last_exploration_bonus 
         # Distance from env_origin
         pos_w = self._robot.data.root_pos_w[:, :2]
         origin = self._get_origins()[:, :2]
@@ -652,11 +728,19 @@ class ChargeprojectEnv(DirectRLEnv):
         # Use the average speed for the penalty calculation instead of instantaneous
         velocity_matching = torch.square(avg_speed - self.cfg.patrol_target_velocity)
 
+        # linear velocity tracking
+        lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self._robot.data.root_lin_vel_b[:, :2]), dim=1)
+        lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25)
+        # yaw rate tracking
+        yaw_rate_error = torch.square(self._commands[:, 2] - self._robot.data.root_ang_vel_b[:, 2])
+        yaw_rate_error_mapped = torch.exp(-yaw_rate_error / 0.25)
         rewards = {
+            "track_lin_vel_xy_exp": lin_vel_error_mapped * self.cfg.lin_vel_reward_scale * self.step_dt,
+            "track_ang_vel_z_exp": yaw_rate_error_mapped * self.cfg.yaw_rate_reward_scale * self.step_dt,
             # Patrol specific rewards
-            "patrol_exploration_reward": patrol_mask * exploration_reward * self.cfg.patrol_exploration_reward_scale * self.step_dt,
-            "patrol_boundary_penalty": patrol_mask * boundary_penalty * self.cfg.patrol_boundary_penalty_scale * self.step_dt,
-            "patrol_velocity_matching": patrol_mask * velocity_matching * self.cfg.patrol_velocity_matching_penalty_scale * self.step_dt,
+            #"patrol_exploration_reward": patrol_mask * exploration_reward * self.cfg.patrol_exploration_reward_scale * self.step_dt,
+            #"patrol_boundary_penalty": patrol_mask * boundary_penalty * self.cfg.patrol_boundary_penalty_scale * self.step_dt,
+            #"patrol_velocity_matching": patrol_mask * velocity_matching * self.cfg.patrol_velocity_matching_penalty_scale * self.step_dt,
 
             #"reach_target_reward": target_reward * self.cfg.reach_target_reward_scale * self.step_dt,
             #"death_penalty": death_penalty * self.cfg.death_penalty_scale * self.step_dt,
@@ -675,7 +759,7 @@ class ChargeprojectEnv(DirectRLEnv):
             "flat_orientation_l2": flat_orientation * self.cfg.flat_orientation_reward_scale * self.step_dt,
             #"body_height_reward": body_height_reward * self.cfg.body_height_reward_scale * self.step_dt,
             #"lower_leg_reward": lower_leg_reward * self.cfg.lower_leg_reward_scale * self.step_dt,
-            "hip_penalty": hip_penalty * self.cfg.hip_penalty_scale * self.step_dt,
+            #"hip_penalty": hip_penalty * self.cfg.hip_penalty_scale * self.step_dt,
             #"feet_under_body_penalty": feet_under_body_penalty * self.cfg.feet_under_body_penalty_scale * self.step_dt,
             #"step_reward": step_reward * self.cfg.step_reward_scale * self.step_dt,
             #"step_length_penalty": step_length_penalty * self.cfg.step_length_penalty_scale * self.step_dt,
@@ -751,9 +835,12 @@ class ChargeprojectEnv(DirectRLEnv):
         self._actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
 
+        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.0, 1.0)
         # Sample new commands
         # self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.0, 1.0)
 
+        # Random spawn rotation
+        yaw = torch.rand(len(env_ids), device=self.device) * 2 * math.pi
 
         origins = self._get_origins()[env_ids]
         # Reset
@@ -762,6 +849,13 @@ class ChargeprojectEnv(DirectRLEnv):
         default_root_state = self._robot.data.default_root_state[env_ids]
         #default_root_state[:, :3] += self.scene.env_origins[env_ids]
         default_root_state[:, :3] += origins
+        # Apply random yaw
+        cos_yaw = torch.cos(yaw)
+        sin_yaw = torch.sin(yaw)
+        default_root_state[:, 3] = 0.0
+        default_root_state[:, 4] = 0.0
+        default_root_state[:, 5] = sin_yaw * 0.7071  # sin(yaw/2)
+        default_root_state[:, 6] = cos_yaw * 0.7071  # cos(yaw/2)
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
