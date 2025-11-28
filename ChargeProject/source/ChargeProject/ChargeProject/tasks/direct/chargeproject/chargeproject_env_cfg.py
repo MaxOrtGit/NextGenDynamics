@@ -15,9 +15,12 @@ from isaaclab.sim.spawners.materials.physics_materials_cfg import RigidBodyMater
 
 #from ChargeProject.tasks.direct.chargeproject.environments import MySceneCfg, ROBOT_CFG
 
+import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.sim import SimulationCfg, PhysxCfg
 from isaaclab.scene import InteractiveSceneCfg
@@ -31,6 +34,32 @@ from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG, TerrainGeneratorC
 from gymnasium import spaces
 
 import isaaclab.terrains as terrain_gen
+
+@configclass
+class EventCfg:
+    """Configuration for randomization."""
+
+    physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "static_friction_range": (0.8, 0.8),
+            "dynamic_friction_range": (0.6, 0.6),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 64,
+        },
+    )
+
+    add_base_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "mass_distribution_params": (-5.0, 5.0),
+            "operation": "add",
+        },
+    )
 
 SIMPLER_ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
     size=(8.0, 8.0),
@@ -103,25 +132,30 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
         "height_data": spaces.Box(-math.inf, math.inf, shape=(25, 25), dtype=float),
         #"nav_data": spaces.Box(-math.inf, math.inf, shape=(3, 33, 33), dtype=float)
     })
+    #observation_space=48+17*11
     state_space = 0 #idk why this is here
 
     # simulation
     decimation = 4
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 200, render_interval=decimation,
-        physx=PhysxCfg(
-            gpu_collision_stack_size = 2**29,
-            gpu_max_rigid_patch_count = 2**19
-        ),
+        #physx=PhysxCfg(
+        #    gpu_collision_stack_size = 2**29,
+        #    gpu_max_rigid_patch_count = 2**19
+        #),
         physics_material=RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
             static_friction=1.0,
             dynamic_friction=1.0,
+            restitution=0.0,
         ),
     )
     # robot(s)
-    robot: ArticulationCfg = SPIDER_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    #robot: ArticulationCfg = SPIDER_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     robot: ArticulationCfg = ANYMAL_C_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     
+    events: EventCfg = EventCfg()
     # Spider Robot (base, leg_hip_i, leg_middle_i, leg_lower_i, leg_foot_i)
     #base_name = "body"
     #foot_names = "leg_foot_.*"
@@ -176,7 +210,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=int(1024*1.5),#0),
+        num_envs=int(1024*4),#0),
         env_spacing=4.0, 
         replicate_physics=True
     )
@@ -184,7 +218,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
-        terrain_generator=ROUGH_TERRAINS_CFG #terrain_gen_cfg, # SIMPLER_ROUGH_TERRAINS_CFG,
+        terrain_generator=ROUGH_TERRAINS_CFG, #terrain_gen_cfg, # SIMPLER_ROUGH_TERRAINS_CFG,
         max_init_terrain_level=9,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -192,6 +226,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
             restitution_combine_mode="multiply",
             static_friction=1.0,
             dynamic_friction=1.0,
+            restitution=0.0,
         ),
         visual_material=sim_utils.MdlFileCfg(
             mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
@@ -226,6 +261,14 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
         mesh_prim_paths=["/World/ground"],
     )
+    #height_scanner = RayCasterCfg(
+    #    prim_path="/World/envs/env_.*/Robot/base",
+    #    offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+    #    ray_alignment="yaw",
+    #    pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
+    #    debug_vis=False,
+    #    mesh_prim_paths=["/World/ground"],
+    #)
     
     base_on_ground_time = 0.5 #seconds before death if base is on ground
 
@@ -249,41 +292,8 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     marker_colors = 57
 
     # Final rewards
-    action_scale = 1.0
+    action_scale = 0.5
     
-
-    # Training stages:
-    # Removed scaling progress/velocity rewards by number of targets reached
-    # init, 2k steps: Learning rate 1e-4 (learning rate may be able to start at 1e-3)
-    #                 joint_leg_middle_leg_lower_ = 125 (may not be needed)
-    #                 Stopped training after velocity/progress became noticeable (2025-10-22_19-49-57_ppo_torch, v1.0.0)
-    # init, 3k steps: Learning rate to 1e-3
-    #                 Stopped training after height ~equal init height (2025-10-22_20-42-36_ppo_torch, v1.0.1)
-    # start, 5.5k steps: After init comments below
-    #                   joint_leg_middle_leg_lower_ = 160 
-    #                   Stopped after it starts "jumping" (2025-10-23_15-28-12_ppo_torch, v1.1.0)
-    # main, 33k steps: Learning rate to 1e-4?
-    #                  After start comments below (2025-10-23_13-09-24_ppo_torch, spiderbot_v1.2.0)
-    #
-
-
-    # x this means bad and ignore
-    # new train on smaller keeps main changes (1.0e-03)
-    # end after 3k steps, (2025-10-23_18-31-31_ppo_torchm, v3.0.0) 
-    #   do --  
-    # end after 3k steps, (2025-10-23_19-17-46_ppo_torch, v3.1.0)
-    #   do --- changes when progress gets too dominant 
-    # end after 4k steps, changes after seeing flaws in reward scales (2025-10-23_19-46-39_ppo_torch, v3.2.0)
-    #   do ----, lr 1.0e-04
-    # end after 8k steps, (2025-10-23_21-43-55_ppo_torch, spiderbot_v3.3.0)
-    #   do ----- 
-    # BAD didn't use this checkpoint for next, skipped loading this checkpoint ~~end After 110k steps, (2025-10-23_23-28-24_ppo_torch, spiderbot_v3.4.0)~~
-    #   do =,
-    # x change to rougher terrain
-    # x end After 14k steps, (2025-10-24_09-37-04_ppo_torch, spiderbot_v3.4.1)
-    #   do ==, divide torques
-
-    #  1e-4 then set to 1e-3 for faster learning
 
     # --- Reward Scales ---
     patrol_exploration_reward_scale = 0.5 * 0.0

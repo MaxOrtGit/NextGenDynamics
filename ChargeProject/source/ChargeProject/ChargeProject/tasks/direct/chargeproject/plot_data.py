@@ -11,7 +11,7 @@ log_dir = None
 POLL_INTERVAL = 1
 # Window size for the moving average. Set to 1 to disable smoothing.
 SMOOTHING_WINDOW = 1
-#log_dir = r"C:\School\NextGenDynamics\ChargeProject\logs\skrl\spiderbot\2025-10-21_10-22-17_ppo_torch"
+#log_dir = r"F:\IsaacLab\logs\skrl\anymal_c_rough_direct\2025-11-27_15-57-02_ppo_torch"
 base_log_dir = "logs/skrl/spiderbot"
 
 
@@ -46,7 +46,7 @@ if log_dir is None:
 
 # Find the .tfevents file automatically
 event_file_path = glob.glob(os.path.join(log_dir, 'events.out.tfevents.*'))[0]
-
+file_name = os.path.basename(event_file_path)
 
 print(f"Reading data from: {event_file_path}")
 
@@ -103,7 +103,7 @@ try:
                 lines[tag_name].set_data(subset_df['step'], subset_df['value'])
 
         # Customize the plot
-        ax.set_title(f"Live Reward Components ({SMOOTHING_WINDOW}-Step Moving Average)", fontsize=18)
+        ax.set_title(f"Live Reward Components ({file_name})", fontsize=18)
         ax.set_xlabel("Training Step", fontsize=12)
         ax.set_ylabel("Smoothed Reward Value", fontsize=12)
         ax.legend(title="Reward Components", bbox_to_anchor=(1.02, 1), loc='upper left')

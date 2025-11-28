@@ -18,34 +18,17 @@ models:
     max_log_std: 2.0
     initial_log_std: 0.0
     network:
-      - name: rnn # must be called rnn
-        input: STATES
-        # lstm is inserted in train.py
-        type: lstm
-        hidden_size: 1024
-        num_layers: 2
-        sequence_length: 128
-        layers: [] #[1024] # must match hidden_size
       - name: net
-        input: rnn
+        input: STATES
         layers: [512, 256, 128]
-        #layers: [256, 128]
         activations: elu
     output: ACTIONS
   value:  # see deterministic_model parameters
     class: DeterministicMixin
     clip_actions: False
     network:
-      - name: rnn # must be called rnn
-        input: STATES
-        # lstm is inserted in train.py
-        type: lstm
-        hidden_size: 1024
-        num_layers: 2
-        sequence_length: 128
-        layers: [] # [1024] # must match hidden_size
       - name: net
-        input: rnn
+        input: STATES
         layers: [512, 256, 128]
         activations: elu
     output: ONE
@@ -81,7 +64,7 @@ agent:
   ratio_clip: 0.2
   value_clip: 0.2
   clip_predicted_values: True
-  entropy_loss_scale: 0.05
+  entropy_loss_scale: 0.005
   value_loss_scale: 1.0
   kl_threshold: 0.0
   rewards_shaper_scale: 0.6
@@ -99,5 +82,5 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 1000000
+  timesteps: 8000
   environment_info: log

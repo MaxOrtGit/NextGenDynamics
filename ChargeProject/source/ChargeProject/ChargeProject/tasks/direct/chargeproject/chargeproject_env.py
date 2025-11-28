@@ -134,56 +134,15 @@ class ChargeprojectEnv(DirectRLEnv):
         # self._commands = torch.zeros(self.num_envs, 3, device=self.device)
 
         self.base_contact_ids, _ = self._contact_sensor.find_bodies(self.cfg.base_name)
-        self.base_body_ids, _ = self._robot.find_bodies(self.cfg.base_name)
+        self.base_body_ids, _ = self._contact_sensor.find_bodies(self.cfg.base_name)
         self.undesired_contact_ids, _ = self._contact_sensor.find_bodies(
             self.cfg.undesired_contact_body_names
         )
         #self.lower_leg_body_ids, _ = self._robot.find_bodies(self.cfg.lower_leg_names)
         #self.hip_joint_ids, _ = self._robot.find_joints(self.cfg.hip_joint_names)
         #self.feet_body_ids, _ = self._robot.find_bodies(self.cfg.foot_names)
-        self.hip_body_ids = []
-        self.leg_joint_ids = []
-        self.feet_contact_ids = []
-        self.dof_idx, _ = self._robot.find_joints(".*")#[]
-        """
-        for i in range(6):
-            vals = []
-            vals.append(self._robot.find_bodies(f".*hip_{i}")[0][0])
-            vals.append(self._robot.find_bodies(f".*upper_{i}")[0][0])
-            vals.append(self._robot.find_bodies(f".*middle_{i}")[0][0])
-            vals.append(self._robot.find_bodies(f".*lower_{i}")[0][0])
-            self.leg_joint_ids.append(vals)
-            self.hip_body_ids.append(vals[0])
-            self.feet_contact_ids.append(self._contact_sensor.find_bodies(f"{self.cfg.foot_names}{i}")[0][0])
-            # WAIT THIS IS BAD self.dof_idx.extend(vals)
-        """
-        self.dof_min_limits = torch.zeros(len(self.dof_idx), device=self.device)
-        self.dof_max_limits = torch.zeros(len(self.dof_idx), device=self.device)
-        self.dof_default_pos = torch.zeros(len(self.dof_idx), device=self.device)
+        self.feet_contact_ids, _ = self._contact_sensor.find_bodies(self.cfg.foot_names)
 
-        # Get limits and default positions from SPIDER_JOINT_INFO
-        for name, value in ANYMAL_JOINT_INFO["limit_min"].items():
-            joint_ids, _ = self._robot.find_joints(name)
-            # get the index in dof_idx
-            for joint_id in joint_ids:
-                idx = self.dof_idx.index(joint_id)
-                self.dof_min_limits[idx] = value
-        for name, value in ANYMAL_JOINT_INFO["limit_max"].items():
-            joint_ids, _ = self._robot.find_joints(name)
-            # get the index in dof_idx
-            for joint_id in joint_ids:
-                idx = self.dof_idx.index(joint_id)
-                self.dof_max_limits[idx] = value
-        for name, value in ANYMAL_JOINT_INFO["default_pos"].items():
-            joint_ids, _ = self._robot.find_joints(name)
-            # get the index in dof_idx
-            for joint_id in joint_ids:
-                idx = self.dof_idx.index(joint_id)
-                self.dof_default_pos[idx] = value
-
-        # Pre-calculate the range of motion on either side of the default position
-        self.positive_range = self.dof_max_limits - self.dof_default_pos
-        self.negative_range = self.dof_default_pos - self.dof_min_limits
         
         #self.feet_step_up_counters = self.cfg.feet_step_time_leeway * torch.ones(self.num_envs, len(self.feet_body_ids), device=self.device)
         #self.feet_step_down_counters = self.cfg.feet_step_time_leeway * torch.ones(self.num_envs, len(self.feet_body_ids), device=self.device)
@@ -209,7 +168,22 @@ class ChargeprojectEnv(DirectRLEnv):
         os.makedirs(log_dir, exist_ok=True)
 
         self.extras["log"] = dict()
-        
+
+        self._episode_sums = {
+            key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            for key in [
+                "track_lin_vel_xy_exp",
+                "track_ang_vel_z_exp",
+                "lin_z_vel_l2",
+                "ang_vel_xy_l2",
+                "dof_torques_l2",
+                "dof_acc_l2",
+                "action_rate_l2",
+                "feet_air_time",
+                "undesired_contacts",
+                "flat_orientation_l2"
+            ]
+        }
 
         # X/Y linear velocity and yaw angular velocity commands
         self._commands = torch.zeros(self.num_envs, 3, device=self.device)
@@ -271,7 +245,7 @@ class ChargeprojectEnv(DirectRLEnv):
         terrain_dims = (terrain_dims[0] + 2 * terrain_gen.border_width,
                         terrain_dims[1] + 2 * terrain_gen.border_width)
         
-        self.map_manager = MapManager(self.cfg, self.num_envs, terrain_dims, self.device)
+        #self.map_manager = MapManager(self.cfg, self.num_envs, terrain_dims, self.device)
 
         if self.cfg.cameras and self.cfg.visualize_nav_data:
             self._create_debug_visualizers()
@@ -281,6 +255,7 @@ class ChargeprojectEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self._actions = actions.clone()
+        self._processed_actions = self.cfg.action_scale * self._actions + self._robot.data.default_joint_pos
         
         #self._update_player_movement()
         
@@ -299,114 +274,9 @@ class ChargeprojectEnv(DirectRLEnv):
             self.loco_height_data = loco_map
             self._visualize_markers()
 
-    def _set_debug_actions(self) -> None:
-        # --- MANUAL GAIT TEST MODE (Corrected) ---
-        
-        # 1. Setup Timing
-        # Lower frequency slightly to make it easier to see individual leg movement
-        freq = 3.0 
-        t = self.common_step_counter * self.step_dt
-        phase = t * freq * 2 * torch.pi
-
-        # 2. Define Gait Parameters
-        swing_amp = 0.5   # Swing forward/back
-        lift_amp = 0.4    # Lift height
-        
-        # 3. Create Base Target from the ROBOT'S internal default, not our cached version.
-        # This ensures 'find_joints' indices match this tensor perfectly.
-        target_pos = self._robot.data.default_joint_pos.clone()
-
-        # 4. Calculate Signals
-        # Signal A: 1 to -1
-        sig_A = torch.sin(torch.tensor(phase, device=self.device))
-        # Signal B: Opposite of A
-        sig_B = -sig_A
-        
-        # Lift Signal (Only lift when swinging forward)
-        lift_sig_A = torch.clamp(torch.sin(torch.tensor(phase, device=self.device)), min=0)
-        lift_sig_B = torch.clamp(torch.sin(torch.tensor(phase + torch.pi, device=self.device)), min=0)
-
-        # 5. Define Groups
-        legs_A = [0, 2, 4]
-        legs_B = [1, 3, 5]
-
-        # 6. Apply to Joints using String Searching
-        for i in range(6):
-            # Construct the specific joint names for this leg number
-            hip_name = f"joint_body_leg_hip_{i}"
-            upper_name = f"joint_leg_hip_leg_upper_{i}"
-            
-            # SEARCH for the index. 
-            # find_joints returns ([indices], [names]). We take the first index.
-            # This is slower than caching, but guarantees we hit the right joint.
-            hip_ids, _ = self._robot.find_joints(hip_name)
-            upper_ids, _ = self._robot.find_joints(upper_name)
-            
-            hip_idx = hip_ids[0]
-            upper_idx = upper_ids[0]
-
-            if i in legs_A:
-                # Group A Logic
-                target_pos[:, hip_idx] += swing_amp * sig_A
-                target_pos[:, upper_idx] += lift_amp * lift_sig_A
-                
-            elif i in legs_B:
-                # Group B Logic (Explicitly used now)
-                target_pos[:, hip_idx] += swing_amp * sig_B
-                target_pos[:, upper_idx] += lift_amp * lift_sig_B
-
-        # 7. Send to Robot
-        # We pass the full tensor, so we don't need to specify joint_ids
-        self.processed_actions = target_pos
-        self._robot.set_joint_position_target(self.processed_actions)
 
     def _apply_action(self) -> None:
-        normalized_actions = self._actions * self.cfg.action_scale
-
-        # For positive actions (0 to 1), scale by the positive range
-        # For negative actions (-1 to 0), scale by the negative range
-        #action_range = torch.where(normalized_actions > 0, self.positive_range, self.negative_range)
-
-        # Calculate the final joint positions
-        #self.processed_actions = self.dof_default_pos + normalized_actions * action_range
-        self.processed_actions = self._robot.data.default_joint_pos + normalized_actions
-        
-        """
-        hip_joint = self.dof_idx.index(self._robot.find_joints("joint_body_leg_hip_1")[0][0])
-        upper_joint = self.dof_idx.index(self._robot.find_joints("joint_leg_hip_leg_upper_1")[0][0])
-        middle_joint = self.dof_idx.index(self._robot.find_joints("joint_leg_upper_leg_middle_1")[0][0])
-        lower_joint = self.dof_idx.index(self._robot.find_joints("joint_leg_middle_leg_lower_1")[0][0])
-        
-        if self.common_step_counter <= 125:
-            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
-            # move the hip joint back
-            self.processed_actions[:, upper_joint] += 3
-        else:#elif self.common_step_counter <= 200:
-            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
-            # Slam the leg down
-            self.processed_actions[:, upper_joint] -= 3
-        """
-        """   
-        lower_joint_ids = self._robot.find_joints("joint_leg_middle_leg_lower_.*")[0]
-        
-        if self.common_step_counter % 500 <= 100:
-            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
-            self.processed_actions[:, lower_joint_ids] -= 1
-            #even_joints = self._robot.find_joints(".*0.*|.*2.*|.*4.*")[0]
-            #even_joints = [j for j in even_joints if j in self.dof_idx]
-            #self.processed_actions[:, even_joints] = 0
-        elif self.common_step_counter % 500 <= 200:
-            self.processed_actions = self._robot.data.default_joint_pos[:, self.dof_idx]
-        elif self.common_step_counter % 500 <= 300:
-            self.processed_actions = 0
-        elif self.common_step_counter % 500 <= 400:
-            self.processed_actions = -self._robot.data.default_joint_pos[:, self.dof_idx]
-        else:
-            self.processed_actions = -self._robot.data.default_joint_pos[:, self.dof_idx]
-            self.processed_actions[:, lower_joint_ids] += 1
-        """
-
-        self._robot.set_joint_position_target(self.processed_actions, joint_ids=self.dof_idx)
+        self._robot.set_joint_position_target(self._processed_actions)
     
     def _can_see_player(self, player_pos_w: torch.Tensor) -> torch.Tensor:
         # Casts a ray from the robot to the player to check for line of sight
@@ -449,6 +319,7 @@ class ChargeprojectEnv(DirectRLEnv):
                     self._commands,
                     self._robot.data.joint_pos - self._robot.data.default_joint_pos,
                     self._robot.data.joint_vel,
+                    #height_data,
                     self._actions,
                 )
                 if tensor is not None
@@ -498,8 +369,8 @@ class ChargeprojectEnv(DirectRLEnv):
                 self._robot.data.projected_gravity_b,
                 self._commands,
                 # Joint info
-                self._robot.data.joint_pos[:, self.dof_idx] - self._robot.data.default_joint_pos[:, self.dof_idx],
-                self._robot.data.joint_vel[:, self.dof_idx],
+                self._robot.data.joint_pos - self._robot.data.default_joint_pos,
+                self._robot.data.joint_vel,
                 self._actions,
                 self.is_contact[:, self.feet_contact_ids].float(),
                 # Where it was moving
@@ -551,11 +422,9 @@ class ChargeprojectEnv(DirectRLEnv):
             torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1
         )
         # joint torques
-        joint_torques = torch.sum(torch.square(self._robot.data.applied_torque[:, self.dof_idx]), dim=1)
+        joint_torques = torch.sum(torch.square(self._robot.data.applied_torque), dim=1)
         # joint acceleration
-        joint_accel = torch.sum(torch.square(self._robot.data.joint_acc[:, self.dof_idx]), dim=1)
-        # dof velocity
-        joint_vel = torch.sum(torch.square(self._robot.data.joint_vel[:, self.dof_idx]), dim=1)
+        joint_accel = torch.sum(torch.square(self._robot.data.joint_acc), dim=1)
 
         # action rate
         action_rate = torch.sum(
@@ -691,8 +560,8 @@ class ChargeprojectEnv(DirectRLEnv):
 
 
         # Penalty for leg joints having angle above 0 radians
-        joint_pos = self._robot.data.joint_pos[:, self.dof_idx]  # [envs, num_joints]
-        joint_default = self._robot.data.default_joint_pos[:, self.dof_idx]  # [num_joints] or 0 if centered
+        joint_pos = self._robot.data.joint_pos  # [envs, num_joints]
+        joint_default = self._robot.data.default_joint_pos # [num_joints] or 0 if centered
         joint_deviation = joint_pos - joint_default
 
         # Mean squared deviation
@@ -745,7 +614,7 @@ class ChargeprojectEnv(DirectRLEnv):
             #"reach_target_reward": target_reward * self.cfg.reach_target_reward_scale * self.step_dt,
             #"death_penalty": death_penalty * self.cfg.death_penalty_scale * self.step_dt,
             #"movement_reward": movement_reward * self.cfg.movement_reward_scale * self.step_dt,
-            "z_vel_l2": z_vel_error * self.cfg.z_vel_reward_scale * self.step_dt,
+            "lin_z_vel_l2": z_vel_error * self.cfg.z_vel_reward_scale * self.step_dt,
             "ang_vel_xy_l2": ang_vel_error * self.cfg.ang_vel_reward_scale * self.step_dt,
             "dof_torques_l2": joint_torques * self.cfg.joint_torque_reward_scale * self.step_dt,
             "dof_acc_l2": joint_accel * self.cfg.joint_accel_reward_scale * self.step_dt,
@@ -774,10 +643,13 @@ class ChargeprojectEnv(DirectRLEnv):
         
         # Logging
         if self.cfg.log:
-            self._log_data("Episode_Reward/total_reward", torch.mean(reward))
+            self._log_data("Step_Reward/total_reward", torch.mean(reward))
             for key, value in rewards.items():
                 episodic_sum_avg = torch.mean(value)
-                self._log_data(f"Episode_Reward/{key}", episodic_sum_avg)
+                self._log_data(f"Step_Reward/{key}", episodic_sum_avg)
+            
+            for key, value in rewards.items():
+                self._episode_sums[key] += value
         
             """
             # Add the average and max amount of targets reached to log
@@ -798,27 +670,10 @@ class ChargeprojectEnv(DirectRLEnv):
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        full_time_out = self.episode_length_buf >= self.max_episode_length - 1
-
-        timed_out = torch.zeros_like(full_time_out, dtype=torch.bool) #self._time_since_target > self._time_outs
-        # change it so seperate time_outs
-        
-        died = self._robot.data.projected_gravity_b[:, 2] > 0.0
-        base_contact_time = self._contact_sensor.data.current_contact_time[:, self.base_body_ids].squeeze(-1)
-        on_ground = base_contact_time > self.cfg.base_on_ground_time
-        fall_off_map = self._robot.data.root_pos_w[:, 2] < -3.0
-        
-        # Logging deaths/time outs per second
-        if self.cfg.log:
-            self._log_data("Episode_Termination/full_time_out", torch.count_nonzero(full_time_out))
-            self._log_data("Episode_Termination/time_out", torch.count_nonzero(timed_out))
-            self._log_data("Episode_Termination/died", torch.count_nonzero(died))
-            self._log_data("Episode_Termination/on_ground", torch.count_nonzero(on_ground))
-            self._log_data("Episode_Termination/fall_off_map", torch.count_nonzero(fall_off_map))
-
-        self.terminated = died | on_ground | fall_off_map
-        self.truncated = timed_out | full_time_out
-        return self.terminated, self.truncated
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        net_contact_forces = self._contact_sensor.data.net_forces_w_history
+        died = torch.any(torch.max(torch.norm(net_contact_forces[:, :, self.base_body_ids], dim=-1), dim=1)[0] > 1.0, dim=1)
+        return died, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
@@ -840,7 +695,7 @@ class ChargeprojectEnv(DirectRLEnv):
         # self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.0, 1.0)
 
         # Random spawn rotation
-        yaw = torch.rand(len(env_ids), device=self.device) * 2 * math.pi
+        #yaw = torch.rand(len(env_ids), device=self.device) * 2 * math.pi
 
         origins = self._get_origins()[env_ids]
         # Reset
@@ -848,14 +703,14 @@ class ChargeprojectEnv(DirectRLEnv):
         joint_vel = self._robot.data.default_joint_vel[env_ids]
         default_root_state = self._robot.data.default_root_state[env_ids]
         #default_root_state[:, :3] += self.scene.env_origins[env_ids]
-        default_root_state[:, :3] += origins
+        default_root_state[:, :3] += self._terrain.env_origins[env_ids]#origins
         # Apply random yaw
-        cos_yaw = torch.cos(yaw)
-        sin_yaw = torch.sin(yaw)
-        default_root_state[:, 3] = 0.0
-        default_root_state[:, 4] = 0.0
-        default_root_state[:, 5] = sin_yaw * 0.7071  # sin(yaw/2)
-        default_root_state[:, 6] = cos_yaw * 0.7071  # cos(yaw/2)
+        #cos_yaw = torch.cos(yaw)
+        #sin_yaw = torch.sin(yaw)
+        #default_root_state[:, 3] = 0.0
+        #default_root_state[:, 4] = 0.0
+        #default_root_state[:, 5] = sin_yaw * 0.7071  # sin(yaw/2)
+        #default_root_state[:, 6] = cos_yaw * 0.7071  # cos(yaw/2)
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
@@ -868,7 +723,7 @@ class ChargeprojectEnv(DirectRLEnv):
         #self._player_movement_angle[env_ids] = torch.rand(len(env_ids), device=self.device) * 2 * math.pi
 
         # Reset MapManager data
-        self.map_manager.reset(env_ids)
+        #self.map_manager.reset(env_ids)
         self.avg_vel_b[env_ids] = 0.0
         
         #if len(env_ids) == self.num_envs:
@@ -876,11 +731,30 @@ class ChargeprojectEnv(DirectRLEnv):
             #self._time_since_target[:] = (-self.cfg.time_out_per_target + 
             #    torch.rand(self.num_envs, device=self.device) * self.cfg.time_out_per_target)
 
+        extras = dict()
+        for key in self._episode_sums.keys():
+            # Mean across the specific environments that are resetting
+            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+            
+            # Log it. dividing by max_episode_length gives you "Average Reward Per Step"
+            # dividing by max_episode_length_s gives you "Average Reward Per Second"
+            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
+            
+            # Reset the accumulator for these environments
+            self._episode_sums[key][env_ids] = 0.0
+            
+        self.extras["log"].update(extras)
+
+
     def _get_origins(self) -> torch.Tensor:
-        spawn_points = MultiBiomeTerrainCfg.spawns_positions
-        loops = np.ceil(self.num_envs / spawn_points.shape[0])
-        terrain_offsets = spawn_points.repeat(int(loops), 1)[: self.num_envs]
-        return self._terrain.env_origins + terrain_offsets
+        # Check if MultiBiomeTerrainCfg has spawn positions
+        if hasattr(MultiBiomeTerrainCfg, "spawns_positions") and MultiBiomeTerrainCfg.spawns_positions is not None:
+            spawn_points = MultiBiomeTerrainCfg.spawns_positions
+            loops = np.ceil(self.num_envs / spawn_points.shape[0])
+            terrain_offsets = spawn_points.repeat(int(loops), 1)[: self.num_envs]
+            return self._terrain.env_origins + terrain_offsets
+        else:
+            return self._terrain.env_origins
 
     def _log_data(self, key, data) -> None:
         self.extras["log"][key] = data
@@ -907,6 +781,68 @@ class ChargeprojectEnv(DirectRLEnv):
         position[:, 6] = 1
         
         self._player.write_root_pose_to_sim(position)
+
+    
+    def _set_debug_actions(self) -> None:
+        # --- MANUAL GAIT TEST MODE (Corrected) ---
+        
+        # 1. Setup Timing
+        # Lower frequency slightly to make it easier to see individual leg movement
+        freq = 3.0 
+        t = self.common_step_counter * self.step_dt
+        phase = t * freq * 2 * torch.pi
+
+        # 2. Define Gait Parameters
+        swing_amp = 0.5   # Swing forward/back
+        lift_amp = 0.4    # Lift height
+        
+        # 3. Create Base Target from the ROBOT'S internal default, not our cached version.
+        # This ensures 'find_joints' indices match this tensor perfectly.
+        target_pos = self._robot.data.default_joint_pos.clone()
+
+        # 4. Calculate Signals
+        # Signal A: 1 to -1
+        sig_A = torch.sin(torch.tensor(phase, device=self.device))
+        # Signal B: Opposite of A
+        sig_B = -sig_A
+        
+        # Lift Signal (Only lift when swinging forward)
+        lift_sig_A = torch.clamp(torch.sin(torch.tensor(phase, device=self.device)), min=0)
+        lift_sig_B = torch.clamp(torch.sin(torch.tensor(phase + torch.pi, device=self.device)), min=0)
+
+        # 5. Define Groups
+        legs_A = [0, 2, 4]
+        legs_B = [1, 3, 5]
+
+        # 6. Apply to Joints using String Searching
+        for i in range(6):
+            # Construct the specific joint names for this leg number
+            hip_name = f"joint_body_leg_hip_{i}"
+            upper_name = f"joint_leg_hip_leg_upper_{i}"
+            
+            # SEARCH for the index. 
+            # find_joints returns ([indices], [names]). We take the first index.
+            # This is slower than caching, but guarantees we hit the right joint.
+            hip_ids, _ = self._robot.find_joints(hip_name)
+            upper_ids, _ = self._robot.find_joints(upper_name)
+            
+            hip_idx = hip_ids[0]
+            upper_idx = upper_ids[0]
+
+            if i in legs_A:
+                # Group A Logic
+                target_pos[:, hip_idx] += swing_amp * sig_A
+                target_pos[:, upper_idx] += lift_amp * lift_sig_A
+                
+            elif i in legs_B:
+                # Group B Logic (Explicitly used now)
+                target_pos[:, hip_idx] += swing_amp * sig_B
+                target_pos[:, upper_idx] += lift_amp * lift_sig_B
+
+        # 7. Send to Robot
+        # We pass the full tensor, so we don't need to specify joint_ids
+        self.processed_actions = target_pos
+        self._robot.set_joint_position_target(self.processed_actions)
 
     def _get_random_colors(self, num_colors: int) -> list[tuple[float, float, float]]:
         colors = []
