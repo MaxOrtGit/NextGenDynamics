@@ -20,7 +20,7 @@ from .map_manager import MapManager
 from .spider_robot import SPIDER_JOINT_INFO
 from .natural_terrain import MultiBiomeTerrainCfg
 
-from .chargeproject_env_cfg import ChargeprojectEnvCfg, ANYMAL_JOINT_INFO
+from .chargeproject_env_cfg import ChargeprojectEnvCfg
 
 from isaaclab.markers.visualization_markers import VisualizationMarkersCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
@@ -130,8 +130,6 @@ class ChargeprojectEnv(DirectRLEnv):
         self.terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        # X/Y linear velocity and yaw angular velocity commands
-        # self._commands = torch.zeros(self.num_envs, 3, device=self.device)
 
         self.base_contact_ids, _ = self._contact_sensor.find_bodies(self.cfg.base_name)
         self.base_body_ids, _ = self._contact_sensor.find_bodies(self.cfg.base_name)
@@ -173,7 +171,8 @@ class ChargeprojectEnv(DirectRLEnv):
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
                 "track_lin_vel_xy_exp",
-                "track_ang_vel_z_exp",
+                "patrol_exploration_reward",
+                "patrol_boundary_penalty",
                 "lin_z_vel_l2",
                 "ang_vel_xy_l2",
                 "dof_torques_l2",
@@ -185,8 +184,8 @@ class ChargeprojectEnv(DirectRLEnv):
             ]
         }
 
-        # X/Y linear velocity and yaw angular velocity commands
-        self._commands = torch.zeros(self.num_envs, 3, device=self.device)
+        # X/Y linear velocity and NOT yaw angular velocity commands
+        self._random_speed = torch.zeros(self.num_envs, device=self.device)
 
         # Save env and config code for reproducibility
         current_file = inspect.getfile(inspect.currentframe())
@@ -214,8 +213,8 @@ class ChargeprojectEnv(DirectRLEnv):
         #self.scene.rigid_objects["player"] = self._player
 
         # we add a height scanner for perceptive locomotion
-        #self._lidar_sensor = RayCaster(self.cfg.lidar_scanner)
-        #self.scene.sensors["lidar_scanner"] = self._lidar_sensor
+        self._lidar_sensor = RayCaster(self.cfg.lidar_scanner)
+        self.scene.sensors["lidar_scanner"] = self._lidar_sensor
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -245,13 +244,14 @@ class ChargeprojectEnv(DirectRLEnv):
         terrain_dims = (terrain_dims[0] + 2 * terrain_gen.border_width,
                         terrain_dims[1] + 2 * terrain_gen.border_width)
         
-        #self.map_manager = MapManager(self.cfg, self.num_envs, terrain_dims, self.device)
+        self.map_manager = MapManager(self.cfg, self.num_envs, terrain_dims, self.device)
 
         if self.cfg.cameras and self.cfg.visualize_nav_data:
             self._create_debug_visualizers()
 
             self.loco_height_data = None
             self.nav_map_data = None
+            self.far_staleness = None
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self._actions = actions.clone()
@@ -259,19 +259,7 @@ class ChargeprojectEnv(DirectRLEnv):
         
         #self._update_player_movement()
         
-        if self.cfg.cameras and self.cfg.visualize_nav_data and False:
-            # Get data from MapManager
-            # (Assuming you have robot_pos, robot_yaw, and lidar_hits)
-            nav_map, loco_map, _, _ = self.map_manager.update(
-                self._get_origins(),
-                self._robot.data.root_pos_w,
-                self._robot.data.heading_w.unsqueeze(-1), # Assuming you have this
-                self._lidar_sensor.data.ray_hits_w # Assuming you have this
-            )
-            
-            # Store for visualization
-            self.nav_map_data = nav_map
-            self.loco_height_data = loco_map
+        if self.cfg.cameras and self.cfg.visualize_nav_data:
             self._visualize_markers()
 
 
@@ -298,16 +286,24 @@ class ChargeprojectEnv(DirectRLEnv):
         self._previous_actions = self._actions.clone()
         
         
-        #nav_data, height_data, far_staleness, self.last_exploration_bonus = self.map_manager.update(
-        #    self._get_origins(),
-        #    self._robot.data.root_pos_w,
-        #    self._robot.data.heading_w.unsqueeze(-1),
-        #    self._lidar_sensor.data.ray_hits_w,
-        #)
+        nav_data, far_staleness, self.last_exploration_bonus = self.map_manager.update(
+            self._get_origins(),
+            self._robot.data.root_pos_w,
+            self._robot.data.heading_w.unsqueeze(-1),
+            self._lidar_sensor.data.ray_hits_w,
+            self.step_dt
+        )
+        
 
         height_data = (
             self._height_scanner.data.pos_w[:, 2].unsqueeze(1) - self._height_scanner.data.ray_hits_w[..., 2] - 0.5
         ).clip(-1.0, 1.0).view(self.num_envs, 25, 25)
+
+    
+        # Store for visualization
+        self.nav_map_data = nav_data
+        self.loco_height_data = height_data
+        self.far_staleness_data = far_staleness
 
         obs = torch.cat(
             [
@@ -316,11 +312,13 @@ class ChargeprojectEnv(DirectRLEnv):
                     self._robot.data.root_lin_vel_b,
                     self._robot.data.root_ang_vel_b,
                     self._robot.data.projected_gravity_b,
-                    self._commands,
+                    self._random_speed.unsqueeze(1),
                     self._robot.data.joint_pos - self._robot.data.default_joint_pos,
                     self._robot.data.joint_vel,
                     #height_data,
                     self._actions,
+
+                    far_staleness,
                 )
                 if tensor is not None
             ],
@@ -330,71 +328,13 @@ class ChargeprojectEnv(DirectRLEnv):
         observations = {
             "observations": obs,
             "height_data": height_data,
-            #"nav_data": nav_data,
-        }
-
-        observations = {"policy": observations}# for rl_games, "critic": observations.clone()}
-
-        return observations
-        """
-        self._previous_actions = self._actions.clone()
-        
-        net_contact_forces = self._contact_sensor.data.net_forces_w_history
-        self.is_contact = (
-            torch.max(
-                torch.norm(
-                    net_contact_forces, dim=-1
-                ),
-                dim=1,
-            )[0]
-            > 1.0
-        )
-        
-        
-        nav_data, height_data, far_staleness, self.last_exploration_bonus = self.map_manager.update(
-            self._get_origins(),
-            self._robot.data.root_pos_w,
-            self._robot.data.heading_w.unsqueeze(-1),
-            self._lidar_sensor.data.ray_hits_w,
-        )
-
-
-        # Concatenate the selected observations into a single tensor.
-        obs = torch.cat(
-            [
-                # Robot state
-                # Base info
-                self._robot.data.root_lin_vel_b,
-                self._robot.data.root_ang_vel_b,
-                self._robot.data.projected_gravity_b,
-                self._commands,
-                # Joint info
-                self._robot.data.joint_pos - self._robot.data.default_joint_pos,
-                self._robot.data.joint_vel,
-                self._actions,
-                self.is_contact[:, self.feet_contact_ids].float(),
-                # Where it was moving
-                self.avg_vel_b,
-
-                # Player relative position
-               # self._player.data.root_pos_w - self._robot.data.root_pos_w,
-
-                # Staleness info
-                far_staleness,
-            ],
-            dim=-1,
-        )
-
-        observations = {
-            "observations": obs,
-            "height_data": height_data.view(self.num_envs, self.cfg.loco_dim, self.cfg.loco_dim),
             "nav_data": nav_data,
         }
-        
-        # Need to clone because of torch.compile
+
         observations = {"policy": observations}# for rl_games, "critic": observations.clone()}
+
         return observations
-        """
+        
 
 
     def _get_rewards(self) -> torch.Tensor:
@@ -404,15 +344,15 @@ class ChargeprojectEnv(DirectRLEnv):
 
     
         # Bonus for getting to target
-        target_reward = torch.zeros(self.num_envs, device=self.device)
+        #target_reward = torch.zeros(self.num_envs, device=self.device)
         #target_reward[reached_target_ids] = torch.log1p(self._targets_reached[reached_target_ids]) + 1
 
 
         # died if gravity is near positive (flipped over)
-        died = self._robot.data.projected_gravity_b[:, 2] > 0.0
-        base_contact_time = self._contact_sensor.data.current_contact_time[:, self.base_contact_ids].squeeze(-1)
-        on_ground = base_contact_time > self.cfg.base_on_ground_time
-        death_penalty = died.float() + on_ground.float()
+        #died = self._robot.data.projected_gravity_b[:, 2] > 0.0
+        #base_contact_time = self._contact_sensor.data.current_contact_time[:, self.base_contact_ids].squeeze(-1)
+        #on_ground = base_contact_time > self.cfg.base_on_ground_time
+        #death_penalty = died.float() + on_ground.float()
 
 
         # z velocity tracking
@@ -435,9 +375,9 @@ class ChargeprojectEnv(DirectRLEnv):
             :, self.feet_contact_ids
         ]
         last_air_time = self._contact_sensor.data.last_air_time[:, self.feet_contact_ids]
-        feet_air_time = torch.sum((last_air_time - 0.5) * first_contact, dim=1) * (
-            torch.norm(self._commands[:, :2], dim=1) > 0.1
-        )
+        feet_air_time = torch.sum((last_air_time - 0.5) * first_contact, dim=1)# * (
+        #    torch.norm(self._commands[:, :2], dim=1) > 0.1
+        #)
         
         #first_air = self._contact_sensor.compute_first_air(self.step_dt)[
         #    :, self.feet_contact_ids
@@ -570,8 +510,8 @@ class ChargeprojectEnv(DirectRLEnv):
         """
         # TODO: instead of mask at end do math on specific states only
         # Patrol specific rewards
-        #patrol_mask = (self.robot_state == RobotState.PATROL).float()
-        #exploration_reward = self.last_exploration_bonus 
+        patrol_mask = (self.robot_state == RobotState.PATROL).float()
+        exploration_reward = self.last_exploration_bonus 
         # Distance from env_origin
         pos_w = self._robot.data.root_pos_w[:, :2]
         origin = self._get_origins()[:, :2]
@@ -581,35 +521,20 @@ class ChargeprojectEnv(DirectRLEnv):
         excess_dist = torch.clamp(dist - self.cfg.patrol_size, min=0.0)
         boundary_penalty = torch.square(excess_dist)
 
-        # 1. Update the Moving Average
-        # We use Body Frame velocity (b) because we want it to commit to a direction relative to itself
-        current_vel_xy = self._robot.data.root_lin_vel_b[:, :2]
-        
-        # Update equation: New_Avg = (Alpha * Current) + ((1-Alpha) * Old_Avg)
-        self.avg_vel_b = (self.vel_smoothing_alpha * current_vel_xy) + \
-                         ((1.0 - self.vel_smoothing_alpha) * self.avg_vel_b)
-
-        # 2. Calculate Reward based on the SMOOTHED velocity
-        # If it vibrates (+1, -1), avg_vel_b becomes ~0. Reward is low.
-        # If it walks (+1, +1), avg_vel_b becomes ~1. Reward is high.
-        avg_speed = torch.linalg.norm(self.avg_vel_b, dim=1)
-        
-        # Use the average speed for the penalty calculation instead of instantaneous
-        velocity_matching = torch.square(avg_speed - self.cfg.patrol_target_velocity)
 
         # linear velocity tracking
-        lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self._robot.data.root_lin_vel_b[:, :2]), dim=1)
+        lin_vel_error = torch.square(self._random_speed - self._robot.data.root_lin_vel_b[:, 0]) + \
+                        torch.square(self._robot.data.root_lin_vel_b[:, 1])
         lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25)
         # yaw rate tracking
-        yaw_rate_error = torch.square(self._commands[:, 2] - self._robot.data.root_ang_vel_b[:, 2])
-        yaw_rate_error_mapped = torch.exp(-yaw_rate_error / 0.25)
+        #yaw_rate_error = torch.square(self._commands[:, 2] - self._robot.data.root_ang_vel_b[:, 2])
+        #yaw_rate_error_mapped = torch.exp(-yaw_rate_error / 0.25)
         rewards = {
             "track_lin_vel_xy_exp": lin_vel_error_mapped * self.cfg.lin_vel_reward_scale * self.step_dt,
-            "track_ang_vel_z_exp": yaw_rate_error_mapped * self.cfg.yaw_rate_reward_scale * self.step_dt,
+            #"track_ang_vel_z_exp": yaw_rate_error_mapped * self.cfg.yaw_rate_reward_scale * self.step_dt,
             # Patrol specific rewards
-            #"patrol_exploration_reward": patrol_mask * exploration_reward * self.cfg.patrol_exploration_reward_scale * self.step_dt,
-            #"patrol_boundary_penalty": patrol_mask * boundary_penalty * self.cfg.patrol_boundary_penalty_scale * self.step_dt,
-            #"patrol_velocity_matching": patrol_mask * velocity_matching * self.cfg.patrol_velocity_matching_penalty_scale * self.step_dt,
+            "patrol_exploration_reward": patrol_mask * exploration_reward * self.cfg.patrol_exploration_reward_scale * self.step_dt,
+            "patrol_boundary_penalty": patrol_mask * boundary_penalty * self.cfg.patrol_boundary_penalty_scale * self.step_dt,
 
             #"reach_target_reward": target_reward * self.cfg.reach_target_reward_scale * self.step_dt,
             #"death_penalty": death_penalty * self.cfg.death_penalty_scale * self.step_dt,
@@ -690,10 +615,10 @@ class ChargeprojectEnv(DirectRLEnv):
         self._actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
 
-        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.0, 1.0)
-        # Sample new commands
-        # self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.0, 1.0)
-
+        #self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.0, 1.0)
+        self._random_speed[env_ids] = torch.zeros_like(self._random_speed[env_ids]).uniform_(
+            self.cfg.speed_min, self.cfg.speed_max
+        )
         # Random spawn rotation
         #yaw = torch.rand(len(env_ids), device=self.device) * 2 * math.pi
 
@@ -703,14 +628,15 @@ class ChargeprojectEnv(DirectRLEnv):
         joint_vel = self._robot.data.default_joint_vel[env_ids]
         default_root_state = self._robot.data.default_root_state[env_ids]
         #default_root_state[:, :3] += self.scene.env_origins[env_ids]
-        default_root_state[:, :3] += self._terrain.env_origins[env_ids]#origins
+        default_root_state[:, :3] += origins
         # Apply random yaw
-        #cos_yaw = torch.cos(yaw)
-        #sin_yaw = torch.sin(yaw)
-        #default_root_state[:, 3] = 0.0
-        #default_root_state[:, 4] = 0.0
-        #default_root_state[:, 5] = sin_yaw * 0.7071  # sin(yaw/2)
-        #default_root_state[:, 6] = cos_yaw * 0.7071  # cos(yaw/2)
+        yaw = (torch.rand(len(env_ids), device=self.device) * 2.0 * torch.pi) - torch.pi
+        sin_half = torch.sin(yaw / 2.0)
+        cos_half = torch.cos(yaw / 2.0)
+        default_root_state[:, 3] = cos_half
+        default_root_state[:, 4] = 0.0       
+        default_root_state[:, 5] = 0.0
+        default_root_state[:, 6] = sin_half
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
@@ -922,6 +848,21 @@ class ChargeprojectEnv(DirectRLEnv):
         )
         self.nav_map_viz = VisualizationMarkers(nav_cfg)
 
+        self.global_pixel_size = self.cfg.patrol_size / self.cfg.staleness_dim
+        
+        global_markers = {
+            "base_staleness": sim_utils.CuboidCfg(
+                size=(1.0, 1.0, 1.0),
+                # Using Red to differentiate from the Blue egocentric view
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.2), opacity=0.2),
+            )
+        }
+        global_cfg = VisualizationMarkersCfg(
+            prim_path="/World/Debug/GlobalStaleViz",
+            markers=global_markers,
+        )
+        self.global_map_viz = VisualizationMarkers(global_cfg)
+
     def _get_egocentric_grid_points(self, dim, map_size, z_data, robot_pos, robot_quat):
         pixel_size = map_size / dim
         
@@ -953,15 +894,17 @@ class ChargeprojectEnv(DirectRLEnv):
             return
 
         env_id = 0
+        env_origin = self._get_origins()[env_id]
         robot_pos = self._robot.data.root_pos_w[env_id]
         robot_quat = self._robot.data.root_quat_w[env_id]
 
+        # --- EXISTING MARKER VISUALIZATION LOGIC ---
         all_translations = []
         all_scales = []
         all_indices = []
 
         # Height map visualizers
-        loco_data = self.loco_height_data[env_id, 0] # (25, 25)
+        loco_data = self.loco_height_data[env_id] # (25, 25)
         
         loco_points = self._get_egocentric_grid_points(
             self.cfg.loco_dim, 
@@ -1058,39 +1001,166 @@ class ChargeprojectEnv(DirectRLEnv):
             marker_indices=nav_indices
         )
 
+
+        # Global Staleness Map Visualizers
+# Fetch raw map (Dim x Dim)
+        base_stale_raw = self.map_manager.staleness_maps[env_id, 0] 
+        dim = self.cfg.staleness_dim
+        
+        # Generate grid indices for the ENTIRE map
+        # 'ij' indexing: y is rows, x is columns
+        indices = torch.arange(dim, device=self.device)
+        grid_y, grid_x = torch.meshgrid(indices, indices, indexing='ij')
+        
+        # Calculate Local Positions (relative to Env Origin)
+        # 0,0 index is at bottom-left: -patrol_size/2
+        # We add 0.5 to sample the center of the cell
+        half_size = self.cfg.patrol_size / 2.0
+        x_local = ((grid_x + 0.5) * self.global_pixel_size) - half_size
+        y_local = ((grid_y + 0.5) * self.global_pixel_size) - half_size
+        
+        # Calculate World Positions (XY)
+        pos_w_x = x_local + env_origin[0]
+        pos_w_y = y_local + env_origin[1]
+        
+        # --- SAMPLE TERRAIN HEIGHT ---
+        # We need to sample self.map_manager.global_height_map at (pos_w_x, pos_w_y)
+        # Normalize world coordinates to [-1, 1] for grid_sample
+        # global_height_map covers [-world_w/2, world_w/2]
+        
+        # Create sampling grid (N, H, W, 2) -> (1, dim, dim, 2)
+        # Note: grid_sample expects (x, y) last dim
+        norm_x = pos_w_x / (self.map_manager.world_w / 2.0)
+        norm_y = pos_w_y / (self.map_manager.world_h / 2.0)
+        
+        sample_grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0)
+        
+        # Sample the global height map
+        # global_height_map is (1, 1, H_global, W_global)
+        terrain_z = torch.nn.functional.grid_sample(
+            self.map_manager.global_height_map, 
+            sample_grid, 
+            align_corners=False, 
+            padding_mode='border'
+        ).squeeze() # Result is (dim, dim)
+        
+        # Flatten everything for visualization
+        flat_x = pos_w_x.flatten()
+        flat_y = pos_w_y.flatten()
+        flat_z_terrain = terrain_z.flatten()
+        flat_stale = base_stale_raw.flatten()
+        
+        # Create Scales
+        # Min height 0.05 so we can see empty cells on the ground
+        bar_height = flat_stale.clamp(min=0.05) * 1.0 
+        
+        base_scales = torch.stack([
+            torch.full_like(bar_height, self.global_pixel_size * 0.95), # Gap for grid look
+            torch.full_like(bar_height, self.global_pixel_size * 0.95),
+            bar_height
+        ], dim=1)
+        
+        # Calculate Z Position (Center of the bar)
+        # Position = Terrain Height + (Bar Height / 2)
+        flat_z = flat_z_terrain + (bar_height / 2.0)
+        
+        base_translations = torch.stack([flat_x, flat_y, flat_z], dim=1)
+        
+        # Visualize All
+        self.global_map_viz.visualize(
+            translations=base_translations,
+            scales=base_scales,
+            marker_indices=torch.zeros(base_translations.shape[0], dtype=torch.int32, device=self.device)
+        )
+
+
+        # --- MATPLOTLIB VISUALIZATION ---
+
         # Extract data and convert to numpy (CPU)
         env_id = 0
         
-        loco_map = self.loco_height_data[env_id, 0].detach().cpu().float().numpy()
+        loco_map = self.loco_height_data[env_id].detach().cpu().float().numpy()
         stale_map = self.nav_map_data[env_id, 0].detach().cpu().float().numpy()
         density_map = self.nav_map_data[env_id, 1].detach().cpu().float().numpy()
         height_map = self.nav_map_data[env_id, 2].detach().cpu().float().numpy()
+        global_stale_map = self.map_manager.staleness_maps[env_id, 0].detach().cpu().float().numpy()
+        far_staleness_vals = self.far_staleness_data[env_id].detach().cpu().numpy()
 
         # Lazy initialization of the figure (runs only once)
         if not hasattr(self, '_viz_fig'):
             plt.ion() # Interactive mode on
-            self._viz_fig, self._viz_axs = plt.subplots(1, 4, figsize=(15, 4))
-            self._viz_im_refs = [None, None, None, None]
             
-            titles = ["Loco Height", "Nav Staleness", "Nav Density", "Nav Height"]
-            for ax, title in zip(self._viz_axs, titles):
-                ax.set_title(title)
-                ax.axis('off') # Hide axis numbers for cleaner look
+            # Create figure with a specific size
+            self._viz_fig = plt.figure(figsize=(18, 4)) 
+            self._viz_axs = []
+            self._viz_im_refs = [None, None, None, None, None] 
+            self._viz_pie_bars = None
 
-        # Update the images
-        maps = [loco_map, stale_map, density_map, height_map]
+            titles = ["Loco Height", "Nav Staleness", "Nav Density", "Nav Height", "Global Staleness"]
+            
+            # Create the first 5 standard image subplots
+            for i in range(5):
+                ax = self._viz_fig.add_subplot(1, 6, i+1)
+                ax.set_title(titles[i])
+                ax.axis('off')
+                self._viz_axs.append(ax)
+            
+            # Create the 6th subplot as POLAR for the pie chart
+            ax_polar = self._viz_fig.add_subplot(1, 6, 6, projection='polar')
+            ax_polar.set_title("Far Staleness")
+            
+            # Configure Polar Plot for Egocentric View
+            # 0 degrees at Top (North/Front)
+            ax_polar.set_theta_zero_location("N") 
+            ax_polar.set_theta_direction(1) 
+            ax_polar.set_yticks([]) # Hide radius labels
+            # Set fixed ticks for 8 directions
+            ax_polar.set_xticks(np.linspace(0, 2*np.pi, 8, endpoint=False))
+            ax_polar.set_xticklabels(['F', 'FL', 'L', 'BL', 'B', 'BR', 'R', 'FR'])
+            
+            self._viz_axs.append(ax_polar)
+
+        # Update the images (First 5 plots)
+        maps = [loco_map, stale_map, density_map, height_map, global_stale_map]
         
         for i, data in enumerate(maps):
             if self._viz_im_refs[i] is None:
-                # First time render
-                # origin='lower' puts (0,0) at bottom-left (standard for grid maps)
                 self._viz_im_refs[i] = self._viz_axs[i].imshow(data, origin='lower', cmap='viridis')
                 self._viz_fig.colorbar(self._viz_im_refs[i], ax=self._viz_axs[i], fraction=0.046, pad=0.04)
             else:
-                # Fast update
                 self._viz_im_refs[i].set_data(data)
-                # Auto-scale colors to min/max of current data
                 self._viz_im_refs[i].set_clim(data.min(), data.max())
+
+        # Update the Far Staleness Pie Chart
+        ax_polar = self._viz_axs[5]
+        
+        # Create angles (0 to 2pi, 8 steps)
+        # Note: Depending on your sensor order, you might need to shift this. 
+        # Assuming index 0 is FRONT (0 deg), index 1 is FRONT-RIGHT (45 deg)...
+        num_wedges = len(far_staleness_vals)
+        theta = np.linspace(0.0, 2 * np.pi, num_wedges, endpoint=False)
+        width = 2 * np.pi / num_wedges
+
+        # We normalize color based on expected staleness range (e.g., 0.0 to 1.0 or dynamic)
+        # Using dynamic max for visualization clarity
+        vmax = max(far_staleness_vals.max(), 1.0)
+        norm = plt.Normalize(vmin=0, vmax=vmax)
+        cmap = plt.get_cmap('viridis')
+
+        if self._viz_pie_bars is None:
+            # Create the bars for the first time
+            self._viz_pie_bars = ax_polar.bar(
+                theta, 
+                np.ones(num_wedges), # Radius of 1.0 gives a full pie look
+                width=width, 
+                bottom=0.0,
+                edgecolor='black',
+                alpha=0.7
+            )
+        
+        # Update colors based on new data
+        for bar, val in zip(self._viz_pie_bars, far_staleness_vals):
+            bar.set_facecolor(cmap(norm(val)))
 
         # Refresh plot without blocking
         plt.draw()

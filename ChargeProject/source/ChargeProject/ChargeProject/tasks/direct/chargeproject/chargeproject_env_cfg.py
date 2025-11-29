@@ -32,6 +32,7 @@ from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG, TerrainGeneratorCfg  # isort: skip
 
 from gymnasium import spaces
+import numpy as np
 
 import isaaclab.terrains as terrain_gen
 
@@ -62,7 +63,7 @@ class EventCfg:
     )
 
 SIMPLER_ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
-    size=(8.0, 8.0),
+    size=(1.0, 1.0),
     border_width=20.0,
     num_rows=1,
     num_cols=1,
@@ -77,35 +78,36 @@ SIMPLER_ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
     },
 )
 
-ANYMAL_JOINT_INFO = { 
-    "default_pos": {
-        ".*HAA": 0.0,
-        ".*F_HFE": 0.4,
-        ".*H_HFE": -0.4,
-        ".*F_KFE": -0.8,
-        ".*H_KFE": 0.8,
-    },
-    "limit_min": {
-        # Left side HAA limits (LF_HAA, LH_HAA)
-        ".*L._HAA": -0.72, 
-        # Right side HAA limits (RF_HAA, RH_HAA)
-        ".*R._HAA": -0.49,
-        # Hip Flexion/Extension (All legs)
-        ".*HFE": -1.5, #-9.42477796077,
-        # Knee Flexion/Extension (All legs)
-        ".*KFE": -2.5, #-9.42477796077,
-    },
-    "limit_max": {
-        # Left side HAA limits (LF_HAA, LH_HAA)
-        ".*L._HAA": 0.49,
-        # Right side HAA limits (RF_HAA, RH_HAA)
-        ".*R._HAA": 0.72,
-        # Hip Flexion/Extension (All legs)
-        ".*HFE": 1.5, #9.42477796077,
-        # Knee Flexion/Extension (All legs)
-        ".*KFE": -0.1, #9.42477796077,
-    },
-}
+
+def generate_rays():
+    # Configuration
+    total_channels = 96  # High density
+    power = 3.0          # Cubic distribution (focus on 0)
+    min_angle = -90.0
+    max_angle = 40.0
+
+    # 1. Calculate ratio of Up vs Down rays based on angle size
+    # This prevents the "sparse top / dense bottom" look
+    span = abs(max_angle) + abs(min_angle)
+    n_up = int(total_channels * (abs(max_angle) / span))
+    n_down = total_channels - n_up
+
+    # 2. Generate normalized curve (0.0 to 1.0) using Power function
+    # We use (i / N)^power
+    t_up = np.linspace(0, 1, n_up + 1)[1:] 
+    t_down = np.linspace(0, 1, n_down + 1)[1:]
+
+    # 3. Apply curves
+    # Up goes from 0 to 40
+    rays_up = max_angle * (t_up ** power)
+    # Down goes from 0 to -90
+    rays_down = min_angle * (t_down ** power)
+
+    # 4. Combine and Sort
+    # Using 'unique' ensures we don't have double 0.0s
+    combined = np.unique(np.concatenate(([0.0], rays_up, rays_down)))
+    return combined.tolist()
+
 
 
 @configclass
@@ -118,19 +120,13 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     log = True
 
     # env
-    episode_length_s = 20.0
+    episode_length_s = 120.0
     # - spaces definition
     action_space = 12 #24
-    """
-    observation_space_old = spaces.Dict({
-        "observations": spaces.Box(-math.inf, math.inf, shape=(97 - 2 - 12*3 - 4 + 3,), dtype=float),
+    observation_space = spaces.Dict({
+        "observations": spaces.Box(-math.inf, math.inf, shape=(48 - 2 + 8,), dtype=float),
         "height_data": spaces.Box(-math.inf, math.inf, shape=(25, 25), dtype=float),
         "nav_data": spaces.Box(-math.inf, math.inf, shape=(3, 33, 33), dtype=float)
-    })"""
-    observation_space = spaces.Dict({
-        "observations": spaces.Box(-math.inf, math.inf, shape=(48,), dtype=float),
-        "height_data": spaces.Box(-math.inf, math.inf, shape=(25, 25), dtype=float),
-        #"nav_data": spaces.Box(-math.inf, math.inf, shape=(3, 33, 33), dtype=float)
     })
     #observation_space=48+17*11
     state_space = 0 #idk why this is here
@@ -139,10 +135,10 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     decimation = 4
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 200, render_interval=decimation,
-        #physx=PhysxCfg(
+        physx=PhysxCfg(
         #    gpu_collision_stack_size = 2**29,
-        #    gpu_max_rigid_patch_count = 2**19
-        #),
+            gpu_max_rigid_patch_count = 2**19
+        ),
         physics_material=RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
@@ -210,7 +206,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=int(1024*4),#0),
+        num_envs=int(4096/2),
         env_spacing=4.0, 
         replicate_physics=True
     )
@@ -218,7 +214,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
-        terrain_generator=ROUGH_TERRAINS_CFG, #terrain_gen_cfg, # SIMPLER_ROUGH_TERRAINS_CFG,
+        terrain_generator=terrain_gen_cfg,
         max_init_terrain_level=9,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -235,18 +231,22 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
     )
 
-
     visualize_nav_data = False
     lidar_scanner = RayCasterCfg(
         prim_path=f"/World/envs/env_.*/Robot/{base_name}",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.4)),
-        ray_alignment="base",
-        max_distance=50.0,
-        pattern_cfg=patterns.LidarPatternCfg(
-            horizontal_fov_range=(-180.0, 180.0), # Full 360-degree sweep
-            vertical_fov_range=(-40, 40),  # Looks 40 deg up and 40 deg down
-            horizontal_res=2.5,            # 
-            channels=1 + int((40+40)/2.5),   # ring every 2.5 deg vertically
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),
+        ray_alignment="yaw",
+        max_distance=32.0,
+        pattern_cfg=#patterns.LidarPatternCfg(
+        #    horizontal_fov_range=(-180.0, 180.0), # Full 360-degree sweep
+        #    vertical_fov_range=(-40, 30),  # Looks 40 deg up and 30 deg down
+        #    horizontal_res=5.0,            # 
+        #    channels=1 + int(1 + (40+30)/1),   # ring every 2.5 deg vertically
+        #),
+        patterns.BpearlPatternCfg(
+            horizontal_fov=360,
+            horizontal_res=5.0,
+            vertical_ray_angles=generate_rays()
         ),
         debug_vis=visualize_nav_data, 
         mesh_prim_paths=["/World/ground"],
@@ -275,8 +275,8 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     player_movement_angular_velocity = 0.5 # radians per second
     player_movement_speed = 1.0 # m/s
 
-    patrol_size = 32.0 # Meters (Area the robot is expected to search)
-    staleness_res = 0.5 # Meters (Resolution of staleness map)
+    patrol_size = 48.0 # Meters (Area the robot is expected to search)
+    staleness_res = 1.0 # Meters (Resolution of staleness map)
     staleness_dim = int(patrol_size / staleness_res) # 64 pixels
     staleness_decay_rate = 1/30 # 30 seconds from clean to fully stale
 
@@ -291,13 +291,17 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     
     marker_colors = 57
 
+
+    speed_min = 0.5
+    speed_max = 2.0
+
     # Final rewards
     action_scale = 0.5
     
 
     # --- Reward Scales ---
-    patrol_exploration_reward_scale = 0.5 * 0.0
-    patrol_boundary_penalty_scale = -10.0
+    patrol_exploration_reward_scale = 2.5
+    patrol_boundary_penalty_scale = -0.5
     patrol_velocity_matching_penalty_scale = -0.25
     patrol_target_velocity = 1.0 # m/s
     lin_vel_reward_scale = 1.0
@@ -316,7 +320,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     action_rate_reward_scale = -0.01# / 2
 
     feet_air_time_reward_scale = 0.5# / 1.5
-    feet_air_time_target = 0.5 # set to 0.4 after start (was 0.7 but not sure if this matters) # ---- set 0.35 # ----- set to 0.6
+    #feet_air_time_target = 0.5 # set to 0.4 after start (was 0.7 but not sure if this matters) # ---- set 0.35 # ----- set to 0.6
     #feet_ground_time_reward_scale = 40
     #feet_ground_time_target = 0.5 # set to 0.4 after start (was 0.7 but not sure if this matters) # ---- set 0.35 # ----- set to 0.6
     
@@ -324,7 +328,7 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     undesired_contact_time_reward_scale = -15
     #desired_contact_reward_scale = 10 * 4 / 8 # add (*4) after start ---- add / 8
     #stable_contact_feet = 2 # ---- set to 2 (was 3)
-    flat_orientation_reward_scale = 0#-5.0
+    flat_orientation_reward_scale = -5.0 /2 #0
     #body_height_reward_scale = 114 / 2 / 2 # * 4 # Remove (*4) after init # add (/2) after start # ----- add / 2
     #lower_leg_reward_scale = 200 / 10 # add (/10) after start
     #hip_penalty_scale = 0#-30 / 5 # ---- Add / 5
@@ -353,3 +357,6 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     # --- State Machine Settings ---
     # 0: Patrol, 1: Investigate, 2: Look, 3: Attack, 4: Hide
     num_states = 5
+
+
+

@@ -5,220 +5,325 @@ from isaaclab.terrains import TerrainGeneratorCfg
 import torch
 from isaaclab.utils import configclass
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 from noise import pnoise2
 
 @dataclass
 class BiomeCfg:
-    """Defines a specific terrain style."""
-    weight: float = 1.0       # The "strength" of this biome in the competition
-    step_size: float = 0.0    # 0.0 = Smooth. >0.0 = Stepped height.
+    """Defines a specific terrain style (Smooth vs Stepped)."""
+    weight: float = 1.0       
+    step_size: float = 0.0    # 0.0 = Smooth slopes. >0.0 = Flat steps.
 
+@dataclass
+class BlockCfg:
+    """Defines a category of blocks (e.g. Debris vs Large Obstacles)."""
+    weight: float = 1.0
+    # (min, max) for base dimensions (X and Y)
+    width_range: Tuple[float, float] = (0.5, 1.0) 
+    # (min, max) for height STICKING OUT of ground
+    height_range: Tuple[float, float] = (0.2, 0.5)
+    # (min, max) multiplier for both width and height
+    scale_range: Tuple[float, float] = (1.0, 1.0)
+    # How deep the object goes into the ground (meters)
+    burial_depth: float = 4.0
 
 def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple[list[trimesh.Trimesh], np.ndarray]:
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     
-    # --- 1. SETUP & CONSTANTS ---
-    # Resolution of the ground mesh (meters). 
-    # 0.1 provides steep "walls" for steps which physics engines like.
-    res = 0.1 
-    
+    # --- 1. SETUP (OPTIMIZED) ---
+    res = cfg.grid_width 
     width_m, length_m = cfg.size[0], cfg.size[1]
-    nx = int(width_m / res)
-    ny = int(length_m / res)
     
-    # Center offsets for noise calculations
+    nx = int(np.ceil(width_m / res))
+    ny = int(np.ceil(length_m / res))
+    
     x_center_offset = (width_m / 2.0)
     y_center_offset = (length_m / 2.0)
 
-    # --- 2. NOISE HELPERS (Vectorized for Mesh, Single for Blocks) ---
+    # --- 2. GENERATE RAW NOISE GRID (VERTEX CENTERED) ---
+    x_verts = np.linspace(0, width_m, nx + 1)
+    y_verts = np.linspace(0, length_m, ny + 1)
+    xx_v, yy_v = np.meshgrid(x_verts, y_verts, indexing="ij")
+    
+    xx_noise = xx_v - x_center_offset
+    yy_noise = yy_v - y_center_offset
+
     v_pnoise = np.vectorize(pnoise2)
-
-    def get_raw_height_noise(x_vals, y_vals):
-        """Calculates base terrain height (hills/valleys) at specific coordinates."""
-        return v_pnoise(
-            x_vals * cfg.noise_scale, 
-            y_vals * cfg.noise_scale, 
-            octaves=cfg.noise_octaves, 
-            persistence=cfg.noise_persistence, 
-            lacunarity=cfg.noise_lacunarity, 
-            repeatx=1024, repeaty=1024, base=cfg.noise_seed
-        ) * cfg.noise_height_scale
-
-    def get_biome_at_points(x_vals, y_vals):
-        """Returns the biome index and weight for given coordinates."""
-        num_p = len(x_vals)
-        scores = np.zeros((len(cfg.biomes), num_p))
-
-        for i, biome in enumerate(cfg.biomes):
-            noise_val = v_pnoise(
-                x_vals * cfg.biome_blend_scale, 
-                y_vals * cfg.biome_blend_scale, 
-                octaves=1, 
-                repeatx=1024, repeaty=1024, base=cfg.noise_seed + ((1+i) * 500)
-            )
-            scores[i] = (noise_val + 1.0) * biome.weight
-        
-        return np.argmax(scores, axis=0)
-
-    # --- 3. GENERATE GROUND MESH ---
-    # Create Grid
-    x = torch.linspace(0, width_m, nx, device=device)
-    y = torch.linspace(0, length_m, ny, device=device)
-    xx, yy = torch.meshgrid(x, y, indexing="ij")
     
-    x_flat = xx.flatten()
-    y_flat = yy.flatten()
+    # Base Terrain Height
+    raw_z_grid = v_pnoise(
+        xx_noise * cfg.noise_scale, 
+        yy_noise * cfg.noise_scale, 
+        octaves=cfg.noise_octaves, 
+        persistence=cfg.noise_persistence, 
+        lacunarity=cfg.noise_lacunarity, 
+        repeatx=1024, repeaty=1024, base=cfg.noise_seed
+    ) * cfg.noise_height_scale
+
+    # Biome Map (Cell Centered)
+    xx_c = (xx_v[:-1, :-1] + xx_v[1:, 1:]) * 0.5
+    yy_c = (yy_v[:-1, :-1] + yy_v[1:, 1:]) * 0.5
+    xx_c_noise = xx_c - x_center_offset
+    yy_c_noise = yy_c - y_center_offset
+
+    scores = np.zeros((len(cfg.biomes), xx_c.size))
+    xf = xx_c_noise.ravel(); yf = yy_c_noise.ravel()
     
-    # Shift to noise coordinates (centered)
-    x_np = (x_flat - x_center_offset).cpu().numpy()
-    y_np = (y_flat - y_center_offset).cpu().numpy()
-
-    # Calculate Terrain Heights
-    raw_z = get_raw_height_noise(x_np, y_np)
-    winning_biomes = get_biome_at_points(x_np, y_np)
-    final_z = np.zeros_like(raw_z)
-
-    # Apply Steps vs Smooth logic
-    for i, biome in enumerate(cfg.biomes):
-        mask = (winning_biomes == i)
-        if not np.any(mask): continue
-        z_chunk = raw_z[mask]
-        
-        if biome.step_size > 0.001:
-            final_z[mask] = np.floor(z_chunk / biome.step_size) * biome.step_size
-        else:
-            final_z[mask] = z_chunk
-
-    # --- 4. FLATTEN SPAWN PLATFORMS ---
-    # Define spawn grid
-    start_pos_x = (width_m / 2.0) - ((cfg.num_spawns_per_side - 1) * cfg.spacing_m / 2.0)
-    start_pos_y = (length_m / 2.0) - ((cfg.num_spawns_per_side - 1) * cfg.spacing_m / 2.0)
+    for i, b in enumerate(cfg.biomes):
+        nv = v_pnoise(xf*cfg.biome_blend_scale, yf*cfg.biome_blend_scale, octaves=1, 
+                      repeatx=1024, repeaty=1024, base=cfg.noise_seed + ((i+1)*500))
+        scores[i] = (nv + 1.0) * b.weight
     
-    spawn_grid_x = np.linspace(start_pos_x, start_pos_x + cfg.spacing_m * (cfg.num_spawns_per_side - 1), cfg.num_spawns_per_side)
-    spawn_grid_y = np.linspace(start_pos_y, start_pos_y + cfg.spacing_m * (cfg.num_spawns_per_side - 1), cfg.num_spawns_per_side)
+    biome_indices = np.argmax(scores, axis=0).reshape(nx, ny)
     
-    # We flatten the ground mesh at these locations
-    half_plat = cfg.platform_width / 2.0
-    spawn_origins_list = [] # For Isaac Lab config
+    is_stepped = np.zeros((nx, ny), dtype=bool)
+    step_sizes = np.zeros((nx, ny), dtype=np.float32)
+    
+    for i, b in enumerate(cfg.biomes):
+        mask = (biome_indices == i)
+        if b.step_size > 0.001:
+            is_stepped[mask] = True
+            step_sizes[mask] = b.step_size
 
-    # Flatten mesh loops
-    for sx in spawn_grid_x:
-        for sy in spawn_grid_y:
-            # Map spawn world pos -> Noise pos
-            sx_noise = sx - x_center_offset
-            sy_noise = sy - y_center_offset
+    # --- 3. APPLY PLATFORMS (Hybrid Fade) ---
+    spawn_origins_list = []
+    
+    start_x = (width_m - (cfg.num_spawns_per_side-1)*cfg.spacing_m)/2.0
+    start_y = (length_m - (cfg.num_spawns_per_side-1)*cfg.spacing_m)/2.0
+    sp_x = np.linspace(start_x, start_x + cfg.spacing_m*(cfg.num_spawns_per_side-1), cfg.num_spawns_per_side)
+    sp_y = np.linspace(start_y, start_y + cfg.spacing_m*(cfg.num_spawns_per_side-1), cfg.num_spawns_per_side)
+    
+    max_rad = cfg.platform_width / 2.0
+    flat_rad = max_rad * cfg.platform_flat_ratio
+    win = int(max_rad / res) + 2
+
+    for sx in sp_x:
+        for sy in sp_y:
+            ix, iy = int(sx/res), int(sy/res)
+            x0, x1 = max(0, ix-win), min(nx+1, ix+win+1)
+            y0, y1 = max(0, iy-win), min(ny+1, iy+win+1)
             
-            # Distance check against all mesh points (Optimized via mask)
-            dx = np.abs(x_np - sx_noise)
-            dy = np.abs(y_np - sy_noise)
+            sub_x = xx_noise[x0:x1, y0:y1]
+            sub_y = yy_noise[x0:x1, y0:y1]
+            sub_z = raw_z_grid[x0:x1, y0:y1]
             
-            dist_mask = (dx < half_plat) & (dy < half_plat)
+            sx_n, sy_n = sx - x_center_offset, sy - y_center_offset
+            dists = np.sqrt((sub_x - sx_n)**2 + (sub_y - sy_n)**2)
             
-            if np.any(dist_mask):
-                # Flatten this area to the average height
-                center_val = np.mean(final_z[dist_mask]) 
-                final_z[dist_mask] = center_val
+            mask_circ = dists < max_rad
+            if not np.any(mask_circ): continue
+            
+            center_h = np.mean(sub_z[mask_circ])
+            
+            mask_flat = dists <= flat_rad
+            sub_z[mask_flat] = center_h
+            
+            mask_fade = (dists > flat_rad) & (dists < max_rad)
+            if np.any(mask_fade):
+                d = dists[mask_fade]
+                z_old = sub_z[mask_fade]
+                t = (d - flat_rad)/(max_rad - flat_rad)
+                alpha = 0.5 * (1 + np.cos(t * np.pi))
+                sub_z[mask_fade] = (center_h * alpha) + (z_old * (1.0 - alpha))
                 
-                # Save for the robot spawn config later
-                # z + 0.5 so the robot drops slightly
-                spawn_origins_list.append([sx, sy, center_val]) 
+                cx0, cx1 = max(0, x0), min(nx, x1)
+                cy0, cy1 = max(0, y0), min(ny, y1)
+                is_stepped[cx0:cx1, cy0:cy1] = False
 
-    # --- 5. BUILD TERRAIN MESH ---
-    # Vertices (x_flat is 0..width, y_flat is 0..length)
-    vertices = np.stack([x_flat.cpu().numpy(), y_flat.cpu().numpy(), final_z], axis=1)
+            raw_z_grid[x0:x1, y0:y1] = sub_z
+            spawn_origins_list.append([sx, sy, center_h])
 
-    # Faces (Grid Topology)
-    ids = np.arange(nx * ny).reshape(nx, ny)
-    f1 = np.stack([ids[:-1, :-1], ids[1:, :-1], ids[:-1, 1:]], axis=2).reshape(-1, 3)
-    f2 = np.stack([ids[1:, :-1], ids[1:, 1:], ids[:-1, 1:]], axis=2).reshape(-1, 3)
-    faces = np.vstack([f1, f2])
+    # --- 4. CONSTRUCT HYBRID MESH ---
+    z_bl = raw_z_grid[:-1, :-1]
+    z_br = raw_z_grid[1:, :-1]
+    z_tl = raw_z_grid[:-1, 1:]
+    z_tr = raw_z_grid[1:, 1:]
+    
+    z_centers = z_bl.copy() 
+    valid_step = step_sizes > 0.001
+    z_centers[valid_step] = np.floor(z_centers[valid_step] / step_sizes[valid_step]) * step_sizes[valid_step]
+    
+    z_bl = np.where(is_stepped, z_centers, z_bl)
+    z_br = np.where(is_stepped, z_centers, z_br)
+    z_tl = np.where(is_stepped, z_centers, z_tl)
+    z_tr = np.where(is_stepped, z_centers, z_tr)
 
-    ground_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-    ground_mesh.fix_normals()
+    # FIX FOR MERGE VERTICES: 
+    # Use exact grid slices for coordinates instead of adding 'res' manually.
+    # This guarantees that the right edge of cell[i] is identical to the left edge of cell[i+1].
+    x_bl = xx_v[:-1, :-1]; y_bl = yy_v[:-1, :-1]
+    x_br = xx_v[1:, :-1];  y_br = yy_v[1:, :-1]
+    x_tr = xx_v[1:, 1:];   y_tr = yy_v[1:, 1:]
+    x_tl = xx_v[:-1, 1:];  y_tl = yy_v[:-1, 1:]
+    
+    cells_v = np.zeros((nx, ny, 4, 3), dtype=np.float32)
+    cells_v[:,:,0,0] = x_bl; cells_v[:,:,0,1] = y_bl; cells_v[:,:,0,2] = z_bl
+    cells_v[:,:,1,0] = x_br; cells_v[:,:,1,1] = y_br; cells_v[:,:,1,2] = z_br
+    cells_v[:,:,2,0] = x_tr; cells_v[:,:,2,1] = y_tr; cells_v[:,:,2,2] = z_tr
+    cells_v[:,:,3,0] = x_tl; cells_v[:,:,3,1] = y_tl; cells_v[:,:,3,2] = z_tl
+
+    total_cells = nx * ny
+    all_verts = cells_v.reshape(-1, 3) 
+    
+    ids = np.arange(0, total_cells * 4, 4)
+    f1 = np.stack([ids, ids+1, ids+2], axis=1)
+    f2 = np.stack([ids, ids+2, ids+3], axis=1)
+    
+    final_faces = [np.vstack([f1, f2])]
+    final_verts = [all_verts]
+    v_offset = all_verts.shape[0]
+
+    # --- 5. GENERATE WALLS (GAP FIXER) ---
+    # X-Walls
+    c_left, c_right = cells_v[:-1, :], cells_v[1:, :]
+    z_l_br, z_l_tr = c_left[:, :, 1, 2], c_left[:, :, 2, 2]
+    z_r_bl, z_r_tl = c_right[:, :, 0, 2], c_right[:, :, 3, 2]
+    
+    gap_mask = (np.abs(z_l_br - z_r_bl) > 0.001) | (np.abs(z_l_tr - z_r_tl) > 0.001)
+    
+    if np.any(gap_mask):
+        wx = c_left[gap_mask, 1, 0]
+        wy_b, wy_t = c_left[gap_mask, 1, 1], c_left[gap_mask, 2, 1]
+        h_l_b, h_l_t = z_l_br[gap_mask], z_l_tr[gap_mask]
+        h_r_b, h_r_t = z_r_bl[gap_mask], z_r_tl[gap_mask]
+        
+        count = len(wx)
+        wv = np.zeros((count, 4, 3), dtype=np.float32)
+        wv[:, 0, 0] = wx; wv[:, 0, 1] = wy_b; wv[:, 0, 2] = h_l_b
+        wv[:, 1, 0] = wx; wv[:, 1, 1] = wy_b; wv[:, 1, 2] = h_r_b
+        wv[:, 2, 0] = wx; wv[:, 2, 1] = wy_t; wv[:, 2, 2] = h_r_t
+        wv[:, 3, 0] = wx; wv[:, 3, 1] = wy_t; wv[:, 3, 2] = h_l_t
+        
+        w_ids = np.arange(v_offset, v_offset + count*4, 4)
+        wf1 = np.stack([w_ids, w_ids+1, w_ids+2], axis=1)
+        wf2 = np.stack([w_ids, w_ids+2, w_ids+3], axis=1)
+        wf3 = np.stack([w_ids, w_ids+2, w_ids+1], axis=1)
+        wf4 = np.stack([w_ids, w_ids+3, w_ids+2], axis=1)
+        
+        final_verts.append(wv.reshape(-1, 3))
+        final_faces.append(np.vstack([wf1, wf2, wf3, wf4]))
+        v_offset += count * 4
+
+    # Y-Walls
+    c_bott, c_top = cells_v[:, :-1], cells_v[:, 1:]
+    z_b_tl, z_b_tr = c_bott[:, :, 3, 2], c_bott[:, :, 2, 2]
+    z_t_bl, z_t_br = c_top[:, :, 0, 2], c_top[:, :, 1, 2]
+    
+    gap_mask_y = (np.abs(z_b_tl - z_t_bl) > 0.001) | (np.abs(z_b_tr - z_t_br) > 0.001)
+    
+    if np.any(gap_mask_y):
+        wy = c_bott[gap_mask_y, 3, 1]
+        wx_l, wx_r = c_bott[gap_mask_y, 3, 0], c_bott[gap_mask_y, 2, 0]
+        h_b_l, h_b_r = z_b_tl[gap_mask_y], z_b_tr[gap_mask_y]
+        h_t_l, h_t_r = z_t_bl[gap_mask_y], z_t_br[gap_mask_y]
+        
+        count = len(wy)
+        wv = np.zeros((count, 4, 3), dtype=np.float32)
+        wv[:, 0, 0] = wx_l; wv[:, 0, 1] = wy; wv[:, 0, 2] = h_b_l
+        wv[:, 1, 0] = wx_l; wv[:, 1, 1] = wy; wv[:, 1, 2] = h_t_l
+        wv[:, 2, 0] = wx_r; wv[:, 2, 1] = wy; wv[:, 2, 2] = h_t_r
+        wv[:, 3, 0] = wx_r; wv[:, 3, 1] = wy; wv[:, 3, 2] = h_b_r
+        
+        w_ids = np.arange(v_offset, v_offset + count*4, 4)
+        wf1 = np.stack([w_ids, w_ids+1, w_ids+2], axis=1)
+        wf2 = np.stack([w_ids, w_ids+2, w_ids+3], axis=1)
+        wf3 = np.stack([w_ids, w_ids+2, w_ids+1], axis=1)
+        wf4 = np.stack([w_ids, w_ids+3, w_ids+2], axis=1)
+        
+        final_verts.append(wv.reshape(-1, 3))
+        final_faces.append(np.vstack([wf1, wf2, wf3, wf4]))
+
+    mesh_v = np.vstack(final_verts)
+    mesh_f = np.vstack(final_faces)
+
+    ground_mesh = trimesh.Trimesh(vertices=mesh_v, faces=mesh_f, process=False)
     
     meshes_list = [ground_mesh]
 
-    # --- 6. GENERATE BLOCKS (The requested part) ---
+    # --- 6. DYNAMIC BLOCKS (UPDATED) ---
     rng = np.random.default_rng(seed=cfg.seed)
-    
-    # Flatten spawn list for fast distance checking
     spawn_origins_arr = np.array(spawn_origins_list) if len(spawn_origins_list) > 0 else np.empty((0,3))
+    
+    # Calculate type weights
+    block_weights = np.array([b.weight for b in cfg.block_types])
+    block_weights /= block_weights.sum() # Normalize
+    
+    # Max safe check
+    max_block_radius = 0.0
+    for b in cfg.block_types:
+        w_max = b.width_range[1] * b.scale_range[1]
+        max_block_radius = max(max_block_radius, w_max)
+    
+    safe_r_sq = (max_rad + max_block_radius)**2
 
     for _ in range(cfg.num_blocks):
-        # Random Size
-        sx = rng.uniform(cfg.block_size_min, cfg.block_size_max)
-        sy = rng.uniform(cfg.block_size_min, cfg.block_size_max)
-        sz = rng.uniform(cfg.block_height_min, cfg.block_height_max)
+        # 6a. Select Block Type
+        b_type: BlockCfg = rng.choice(cfg.block_types, p=block_weights)
         
-        # Random Position (World Coords)
+        # 6b. Generate Dimensions (Width, Height, Scale)
+        # We generate random width (X) and length (Y) independently for variety, 
+        # or share if you want perfect squares. Let's do independent.
+        raw_sx = rng.uniform(b_type.width_range[0], b_type.width_range[1])
+        raw_sy = rng.uniform(b_type.width_range[0], b_type.width_range[1])
+        raw_h  = rng.uniform(b_type.height_range[0], b_type.height_range[1])
+        
+        global_scale = rng.uniform(b_type.scale_range[0], b_type.scale_range[1])
+        
+        sx = raw_sx * global_scale
+        sy = raw_sy * global_scale
+        h_above = raw_h * global_scale
+        
+        # 6c. Position
         pos_x = rng.uniform(2.0, width_m - 2.0)
         pos_y = rng.uniform(2.0, length_m - 2.0)
 
-        # 6a. Check Platform Collision
-        # We don't want to block the spawn pads
-        is_on_platform = False
+        # Check spawn distance
         if len(spawn_origins_arr) > 0:
-            # Vectorized distance check against all spawn points
-            dists_x = np.abs(pos_x - spawn_origins_arr[:, 0])
-            dists_y = np.abs(pos_y - spawn_origins_arr[:, 1])
-            # If inside any platform box
-            if np.any((dists_x < (half_plat + sx)) & (dists_y < (half_plat + sy))):
-                is_on_platform = True
-        
-        if is_on_platform: 
-            continue 
+            d_sq = (pos_x - spawn_origins_arr[:,0])**2 + (pos_y - spawn_origins_arr[:,1])**2
+            if np.any(d_sq < safe_r_sq): continue
 
-        # 6b. Calculate Height at this specific spot
-        # We must transform World Coords -> Noise Coords
-        pos_x_noise = pos_x - x_center_offset
-        pos_y_noise = pos_y - y_center_offset
+        # 6d. Height Calculation (Burial)
+        ix = int(pos_x / res)
+        iy = int(pos_y / res)
+        ix = min(max(0, ix), nx-1)
+        iy = min(max(0, iy), ny-1)
         
-        # Re-run the biome logic for this single point to get exact ground height
-        # This ensures the block sits perfectly on steps or smooth slopes
-        b_idx = get_biome_at_points(np.array([pos_x_noise]), np.array([pos_y_noise]))[0]
-        biome = cfg.biomes[b_idx]
-        raw_z_block = get_raw_height_noise(np.array([pos_x_noise]), np.array([pos_y_noise]))[0]
-        
-        if biome.step_size > 0.001:
-            ground_z = np.floor(raw_z_block / biome.step_size) * biome.step_size
-        else:
-            ground_z = raw_z_block
+        cell_corners = cells_v[ix, iy, :, 2]
+        ground_z = np.mean(cell_corners)
 
-        # 6c. Create and Position Block
-        # Center of box Z = ground_z + half height
-        # Note: If you want blocks slightly sunken to prevent bottom gaps, subtract 0.1
-        final_block_z = ground_z + (sz / 2.0) - 0.05 
+        # Logic: 
+        # We want 'h_above' to be the amount sticking OUT.
+        # We want 'b_type.burial_depth' to be the amount HIDDEN.
+        # Total physical height of box = h_above + burial_depth.
+        # Center Z = ground_z - burial_depth + (total_height / 2).
         
-        box = trimesh.creation.box(extents=(sx, sy, sz))
+        total_h = h_above + b_type.burial_depth
+        final_block_z = ground_z - b_type.burial_depth + (total_h / 2.0)
         
-        # Transform
+        box = trimesh.creation.box(extents=(sx, sy, total_h))
         transform = np.eye(4)
-        rot_matrix = trimesh.transformations.rotation_matrix(rng.uniform(0, 2 * np.pi), [0, 0, 1])
-        transform[:3, :3] = rot_matrix[:3, :3]
+        rot = trimesh.transformations.rotation_matrix(rng.uniform(0, 2*np.pi), [0, 0, 1])
+        transform[:3, :3] = rot[:3, :3]
         transform[:3, 3] = [pos_x, pos_y, final_block_z]
-        
         box.apply_transform(transform)
         meshes_list.append(box)
 
-    # --- 7. FINALIZE ---
     if len(spawn_origins_list) > 0:
         MultiBiomeTerrainCfg.spawns_positions = torch.tensor(spawn_origins_list, device=device, dtype=torch.float32)
     else:
-        # Fallback if map is tiny
         MultiBiomeTerrainCfg.spawns_positions = torch.zeros((1,3), device=device)
 
     return meshes_list, np.zeros(3)
 
 @configclass
 class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
-    grid_width: float = 0.25         
+    grid_width: float = 0.125         
     terrain_height: float = 5.0 # needs to be high enough for noise range 
 
     # --- Terrain Shape (The Geometry) ---
     noise_seed: int = 123
-    noise_scale: float = 0.05       # Frequency of the Perlin noise (higher = more hills/valleys)
-    noise_height_scale: float = 2.0 # Amplitude of the Perlin noise
+    noise_scale: float = 0.03       # Frequency of the Perlin noise (higher = more hills/valleys)
+    noise_height_scale: float = 4.0 # Amplitude of the Perlin noise
     noise_octaves: int = 5
     noise_persistence: float = 0.5
     noise_lacunarity: float = 2.0
@@ -226,25 +331,46 @@ class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
     # --- Biome Distribution Settings ---
     biome_blend_scale: float = 0.10   # Higher = Choppier transitions. Lower = Larger continents.
     
-    # --- THE BIOME LIST ---
-    biomes: List[BiomeCfg] = field(default_factory=lambda: [
-        BiomeCfg(weight=1.1, step_size=0.0), # Smooth
-        BiomeCfg(weight=1.0, step_size=0.0),
-        BiomeCfg(weight=1.0, step_size=0.05),
-        BiomeCfg(weight=0.9, step_size=0.1),
+    # --- THE BIOME list ---
+    biomes: list[BiomeCfg] = field(default_factory=lambda: [
+        BiomeCfg(weight=1.07, step_size=0.0), # Smooth
+        BiomeCfg(weight=1.0, step_size=0.1),
+        BiomeCfg(weight=0.9, step_size=0.2),
         #BiomeCfg(weight=0.8, step_size=0.3),
-        BiomeCfg(weight=0.7, step_size=0.2), # Giant cliffs
+        BiomeCfg(weight=0.7, step_size=0.3), # Giant cliffs
     ])
 
     # --- Objects ---
-    num_blocks: int = 500             
-    block_size_min: float = 0.5; block_size_max: float = 1.5      
-    block_height_min: float = 1.0; block_height_max: float = 2.5    
+    num_blocks: int = 4000
+    block_types: list[BlockCfg] = field(default_factory=lambda: [
+        # 1. Traversable Debris (Low, walkable)
+        BlockCfg(
+            weight=8.0,
+            width_range=(0.3, 0.6),
+            height_range=(0.05, 0.15), # Low height
+            scale_range=(1.0, 1.0),
+        ),
+        # 2. Medium Obstacles (might be climbable)
+        BlockCfg(
+            weight=1.0,
+            width_range=(0.4, 0.75),
+            height_range=(0.3, 0.6),
+            scale_range=(1.0, 1.5),
+        ),
+        # 3. Giant Monoliths (Block the path)
+        BlockCfg(
+            weight=0.5,
+            width_range=(1.0, 2.0),
+            height_range=(1.5, 3.0),
+            scale_range=(1.0, 2.0),
+        )
+    ])
 
     num_spawns_per_side = 5
     spacing_m = 20.0  
     spawns_positions: np.ndarray = None
-    platform_width: float = 1.75  
+    platform_width: float = 4.0
+    platform_flat_ratio: float = 0.5
 
 terrain_gen_cfg = TerrainGeneratorCfg(
     seed=42,

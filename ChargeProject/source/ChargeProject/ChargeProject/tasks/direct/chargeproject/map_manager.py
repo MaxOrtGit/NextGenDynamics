@@ -127,9 +127,9 @@ class MapManager:
         far_staleness = self._get_far_staleness(robot_pos_w, robot_yaw_w, env_origins)
 
         # Generate Standard Observations
-        nav_map, loco_map = self._sample_egocentric_maps(robot_pos_w, robot_yaw_w, lidar_hits_w, env_origins)
+        nav_map = self._sample_egocentric_maps(robot_pos_w, robot_yaw_w, lidar_hits_w, env_origins)
 
-        return nav_map, loco_map, far_staleness, cleared_value
+        return nav_map, far_staleness, cleared_value
 
     def _update_staleness_map(self, lidar_hits_w, env_origins, dt):
         # Decay (Everything gets dusty)
@@ -231,15 +231,15 @@ class MapManager:
         nav_height = F.grid_sample(self.global_height_map.expand(self.num_envs, -1, -1, -1), grid_nav, align_corners=False, padding_mode='border')
         
         # Loco Height (25x25, 2.4m wide)
-        zoom_loco = self.config.loco_size / self.world_w
-        theta_loco = self._get_affine_matrix(zoom_loco, cos, sin, tx, ty)
-        grid_loco = F.affine_grid(theta_loco, torch.Size((self.num_envs, 1, self.config.loco_dim, self.config.loco_dim)), align_corners=False)
-        loco_height = F.grid_sample(self.global_height_map.expand(self.num_envs, -1, -1, -1), grid_loco, align_corners=False, padding_mode='border')
+        #zoom_loco = self.config.loco_size / self.world_w
+        #theta_loco = self._get_affine_matrix(zoom_loco, cos, sin, tx, ty)
+        #grid_loco = F.affine_grid(theta_loco, torch.Size((self.num_envs, 1, self.config.loco_dim, self.config.loco_dim)), align_corners=False)
+        #loco_height = F.grid_sample(self.global_height_map.expand(self.num_envs, -1, -1, -1), grid_loco, align_corners=False, padding_mode='border')
         
         # Normalize Heights: Subtract Robot Z so feet are at ~0
         robot_z = robot_pos_w[:, 2].view(self.num_envs, 1, 1, 1)
         nav_height -= robot_z
-        loco_height -= robot_z
+        #loco_height -= robot_z
 
         # --- Prepare Affine Data for Local Staleness ---
         # Normals relative to Patrol Zone [-1, 1]
@@ -278,7 +278,7 @@ class MapManager:
         # Combine Nav Inputs: (N, 3, 33, 33)
         nav_combined = torch.cat([nav_staleness, nav_density, nav_height], dim=1)
         
-        return nav_combined, loco_height
+        return nav_combined#, loco_height
 
     def _get_affine_matrix(self, scale, cos, sin, tx, ty):
         theta = torch.zeros(self.num_envs, 2, 3, device=self.device)

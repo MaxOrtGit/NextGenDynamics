@@ -31,9 +31,9 @@ class HeightMapEncoder(nn.Module):
             nn.ELU(),
             nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=0), # 11x11 -> 5x5, 400
             nn.ELU(),
-            nn.Conv2d(16, 16, kernel_size=2, stride=2, padding=0), # 5x5 -> 2x2, 64
+            nn.Conv2d(16, 16, kernel_size=3, stride=2, padding=0), # 5x5 -> 2x2, 64
             nn.ELU(),
-            nn.Flatten(),
+            nn.Flatten(), # 64
         )
 
     def forward(self, x):
@@ -42,6 +42,34 @@ class HeightMapEncoder(nn.Module):
         x_channel, y_channel = get_coordinate_grid(batch_size, h, w, device)
         
         return self.net(torch.cat([x, x_channel, y_channel], dim=1))
+
+
+class NavigationMapEncoder(nn.Module):
+    def __init__(self, input_channels=3, ):
+        super().__init__()
+
+        self.net = nn.Sequential( #33x33
+            nn.Conv2d(input_channels + 2, 8, kernel_size=9, stride=2, padding=0), # 33x33 -> 13x13
+            nn.ELU(),
+            nn.Conv2d(8, 16, kernel_size=5, stride=2, padding=0), # 13x13 -> 5x5
+            nn.ELU(),
+            nn.Conv2d(16, 16, kernel_size=3, stride=2, padding=0), # 5x5 -> 2x2
+            nn.ELU(),
+            nn.Flatten(),
+        )
+
+    def forward(self, x):
+        # x shape: (Batch, 3, H, W) -> Staleness, Ray Cast Density, Height
+
+        batch_size, _, h, w = x.shape
+        device = x.device
+        
+        x_channel, y_channel = get_coordinate_grid(batch_size, h, w, device)
+        
+        # Concatenate: (Batch, 3, H, W) + (Batch, 1, H, W) + (Batch, 1, H, W) -> (Batch, 5, H, W)
+        x_with_coords = torch.cat([x, x_channel, y_channel], dim=1)
+        
+        return self.net(x_with_coords)
 
 class SharedRecurrentModel(GaussianMixin,DeterministicMixin, Model):
     def __init__(self, observation_space, action_space, device):
@@ -58,6 +86,7 @@ class SharedRecurrentModel(GaussianMixin,DeterministicMixin, Model):
         DeterministicMixin.__init__(self, clip_actions=False, role="value")
         
         self.height_encoder = HeightMapEncoder()
+        self.nav_encoder = NavigationMapEncoder()
         self.net_container = nn.Sequential(
             nn.LazyLinear(out_features=512),
             nn.ELU(),
@@ -83,7 +112,8 @@ class SharedRecurrentModel(GaussianMixin,DeterministicMixin, Model):
             # height map now is in states["height_data"]
             states = unflatten_tensorized_space(self.observation_space, inputs.get("states"))
             height_out = self.height_encoder(states["height_data"].unsqueeze(1))
-            net = self.net_container(torch.concatenate([states["observations"], height_out], dim=1))
+            nav_out = self.nav_encoder(states["nav_data"])
+            net = self.net_container(torch.concatenate([states["observations"], height_out, nav_out], dim=1))
             self._shared_output = net
 
         if role == "policy":
