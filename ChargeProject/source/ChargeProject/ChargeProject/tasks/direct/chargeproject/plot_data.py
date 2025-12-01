@@ -11,8 +11,9 @@ log_dir = None
 POLL_INTERVAL = 1
 # Window size for the moving average. Set to 1 to disable smoothing.
 SMOOTHING_WINDOW = 1
-#log_dir = r"F:\IsaacLab\logs\skrl\anymal_c_rough_direct\2025-11-27_15-57-02_ppo_torch"
+#log_dir = r"G:\Code\NextGenDynamics\ChargeProject\logs\skrl\spiderbot\2025-11-29_13-13-46_ppo_torch"
 base_log_dir = "logs/skrl/spiderbot"
+base_tag = "Step" # "Episode" or "Step"
 
 
 # Parses tfevents into a DataFrame
@@ -24,11 +25,11 @@ def parse_tfevents_to_dataframe(acc):
     all_data = []
     for tag in tags:
         # Filter for only the reward-related tags at the source
-        if tag.startswith('Info / Episode_Reward/'):
+        if tag.startswith(f'Info / {base_tag}_Reward/'):
             events = acc.Scalars(tag)
             for event in events:
                 all_data.append({
-                    'tag': tag.replace('Info / Episode_Reward/', ''),
+                    'tag': tag.replace(f'Info / {base_tag}_Reward/', ''),
                     'step': event.step,
                     'value': event.value
                 })
@@ -85,7 +86,7 @@ try:
             if SMOOTHING_WINDOW > 1:
                 subset_df['value'] = subset_df['value'].rolling(window=SMOOTHING_WINDOW, min_periods=1).mean()
 
-            clean_label = tag_name.replace('Episode_Reward/', '')
+            clean_label = tag_name.replace(f'{base_tag}_Reward/', '')
             
             # If this is a new tag, create a new line object
             if tag_name not in lines:

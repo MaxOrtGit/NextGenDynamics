@@ -56,8 +56,10 @@
             "name": "Python: Play Environment",
             "type": "python",
             "request": "launch",
-            "args" : ["--task", "Chargeproject-Direct-v0", "--num_envs", "8"],
-            "program": "${workspaceFolder}/scripts/rsl_rl/play.py",
+            "args" : ["--task", "Chargeproject-Direct-v0", "--num_envs", "8",
+                      "--checkpoint", "checkpoints\\AnymalMap\\PA_v1.0.0.pt",
+                    ],
+            "program": "${workspaceFolder}/scripts/skrlcustom/play.py",
             "console": "integratedTerminal"
         },
         {

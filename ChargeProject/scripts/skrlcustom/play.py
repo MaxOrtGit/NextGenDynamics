@@ -46,7 +46,7 @@ parser.add_argument(
     "--ml_framework",
     type=str,
     default="torch",
-    choices=["torch", "jax", "jax-numpy"],
+    choices=["torch"],
     help="The ML framework used for training the skrl agent.",
 )
 parser.add_argument(
@@ -92,10 +92,11 @@ if version.parse(skrl.__version__) < version.parse(SKRL_VERSION):
     )
     exit()
 
-if args_cli.ml_framework.startswith("torch"):
-    from skrl.utils.runner.torch import Runner
-elif args_cli.ml_framework.startswith("jax"):
-    from skrl.utils.runner.jax import Runner
+# Import specific components to match training script
+from skrl.memories.torch import RandomMemory
+from skrl.agents.torch.ppo import PPO_RNN
+from skrl.resources.preprocessors.torch import RunningStandardScaler
+from skrl.utils import set_seed
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -114,17 +115,18 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import ChargeProject.tasks  # noqa: F401
+from ChargeProject.tasks.direct.chargeproject.agents.skrl_custom_ppo_model import SharedRecurrentModel
 
 # config shortcuts
 if args_cli.agent is None:
     algorithm = args_cli.algorithm.lower()
-    agent_cfg_entry_point = "skrl_cfg_entry_point" if algorithm in ["ppo"] else f"skrl_{algorithm}_cfg_entry_point"
+    agent_cfg_entry_point = "skrl_custom_cfg_entry_point" if algorithm in ["ppo"] else f"skrl_custom_{algorithm}_cfg_entry_point"
 else:
     agent_cfg_entry_point = args_cli.agent
 
 
 @hydra_task_config(args_cli.task, agent_cfg_entry_point)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, experiment_cfg: dict):
+def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Play with skrl agent."""
     # grab task name for checkpoint path
     task_name = args_cli.task.split(":")[-1]
@@ -134,23 +136,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    # configure the ML framework into the global skrl variable
-    if args_cli.ml_framework.startswith("jax"):
-        skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
-
-        # randomly sample a seed if seed = -1
+    # randomly sample a seed if seed = -1
     if args_cli.seed == -1:
         args_cli.seed = random.randint(0, 10000)
 
     # set the agent and environment seed from command line
     # note: certain randomization occur in the environment initialization so we set the seed here
-    experiment_cfg["seed"] = args_cli.seed if args_cli.seed is not None else experiment_cfg["seed"]
-    env_cfg.seed = experiment_cfg["seed"]
+    agent_cfg["seed"] = args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
+    env_cfg.seed = agent_cfg["seed"]
 
     # specify directory for logging experiments (load checkpoint)
-    log_root_path = os.path.join("logs", "skrl", experiment_cfg["agent"]["experiment"]["directory"])
+    log_root_path = os.path.join("logs", "skrl", agent_cfg["agent"]["experiment"]["directory"])
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
+    
     # get checkpoint path
     if args_cli.use_pretrained_checkpoint:
         resume_path = get_published_pretrained_checkpoint("skrl", train_task_name)
@@ -194,21 +193,56 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # wrap around environment for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
 
-    # configure and instantiate the skrl runner
-    # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
-    experiment_cfg["trainer"]["close_environment_at_exit"] = False
-    experiment_cfg["agent"]["experiment"]["write_interval"] = 0  # don't log to TensorBoard
-    experiment_cfg["agent"]["experiment"]["checkpoint_interval"] = 0  # don't generate checkpoints
-    runner = Runner(env, experiment_cfg)
+    # set seed
+    set_seed(agent_cfg["seed"])
 
+    device = env.device
+
+    # --- Reconstruct the Agent (Matching Train Script) ---
+    
+    # We do not need a large memory for play, but the agent constructor requires it.
+    memory = RandomMemory(memory_size=16, num_envs=env.num_envs, device=device)
+
+    models = {}
+    models["policy"] = SharedRecurrentModel(
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device=device
+    )
+    models["value"] = models["policy"]
+
+    cfg = agent_cfg["agent"].copy()
+    
+    # Ensure preprocessors match training configuration
+    cfg["state_preprocessor"] = RunningStandardScaler
+    cfg["state_preprocessor_kwargs"] = {"size": env.observation_space, "device": device}
+    cfg["value_preprocessor"] = RunningStandardScaler
+    cfg["value_preprocessor_kwargs"] = {"size": 1, "device": device}
+
+    agent = PPO_RNN(
+        models=models,
+        memory=memory,
+        cfg=cfg,
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device=device,
+    )
+
+    agent.init()
+
+    # load checkpoint
     print(f"[INFO] Loading model checkpoint from: {resume_path}")
-    runner.agent.load(resume_path)
+    agent.load(resume_path)
+    
     # set agent to evaluation mode
-    runner.agent.set_running_mode("eval")
+    agent.set_running_mode("eval")
+
+    # --- Play Loop ---
 
     # reset environment
     obs, _ = env.reset()
     timestep = 0
+    
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -216,15 +250,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
-            outputs = runner.agent.act(obs, timestep=0, timesteps=0)
+            # act() returns (actions, log_prob, outputs)
+            # outputs might contain mean_actions or other info depending on the model
+            actions, _, outputs = agent.act(obs, timestep=0, timesteps=0)
+            
             # - multi-agent (deterministic) actions
             if hasattr(env, "possible_agents"):
-                actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
+                # Warning: check your dictionary keys in outputs if using MARL
+                actions = {a: outputs.get("mean_actions", actions)[a] for a in env.possible_agents}
             # - single-agent (deterministic) actions
             else:
-                actions = outputs[-1].get("mean_actions", outputs[0])
+                # Use mean_actions for deterministic playback if available, else sampled actions
+                if isinstance(outputs, dict) and "mean_actions" in outputs:
+                    actions = outputs["mean_actions"]
+
             # env stepping
             obs, _, _, _, _ = env.step(actions)
+
         if args_cli.video:
             timestep += 1
             # exit the play loop after recording one video

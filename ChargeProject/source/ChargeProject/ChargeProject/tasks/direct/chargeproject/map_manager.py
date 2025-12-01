@@ -181,39 +181,61 @@ class MapManager:
         return total_cleared_value
 
     def _get_far_staleness(self, robot_pos_w, robot_yaw_w, env_origins):
-        """Samples staleness at 8 cardinal directions rotated by robot yaw."""
-        cos = torch.cos(robot_yaw_w).squeeze(-1)
-        sin = torch.sin(robot_yaw_w).squeeze(-1)
-        
-        # Rotate offsets by Robot Yaw
-        x_off = self.far_sensor_offsets[:, 0]
-        y_off = self.far_sensor_offsets[:, 1] 
-        
-        # Rotated offsets (N, 8)
-        rx = x_off.unsqueeze(0) * cos.unsqueeze(1) - y_off.unsqueeze(0) * sin.unsqueeze(1)
-        ry = x_off.unsqueeze(0) * sin.unsqueeze(1) + y_off.unsqueeze(0) * cos.unsqueeze(1)
-        
-        # Add to Robot Position to get World Position
-        # (N, 1) + (N, 8)
-        px = robot_pos_w[:, 0].unsqueeze(1) + rx
-        py = robot_pos_w[:, 1].unsqueeze(1) + ry
-        
-        # Normalize to [-1, 1] grid coordinates relative to Patrol Box
-        # grid = (pos - env_origin) / (patrol_size/2)
-        rel_x = px - env_origins[:, 0].unsqueeze(1)
-        rel_y = py - env_origins[:, 1].unsqueeze(1)
-        
-        norm_x = rel_x / (self.config.patrol_size / 2.0)
-        norm_y = rel_y / (self.config.patrol_size / 2.0)
-        
-        # Stack for grid_sample: (N, 1, 8, 2) -> Treated as a "Line" image of width 8
-        grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(1)
-        
-        # Sample
-        # Output: (N, 1, 1, 8)
-        samples = F.grid_sample(self.staleness_maps, grid, align_corners=False, padding_mode='border')
-        
-        return samples.view(self.num_envs, 8)
+        B = self.num_envs
+        H = W = self.config.staleness_dim
+        device = self.device
+
+        # ----- 1. Build pixel coordinate grid for the staleness map -----
+        # Pixel centers in [-1,1]
+        xs = torch.linspace(-1, 1, W, device=device)
+        ys = torch.linspace(-1, 1, H, device=device)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")   # (H,W)
+
+        grid = torch.stack([gx, gy], dim=-1)             # (H,W,2)
+        grid = grid.view(1, H, W, 2).expand(B, -1, -1, -1)   # (B,H,W,2)
+
+        # Convert to metric world coordinates inside the patrol zone
+        half = self.config.patrol_size / 2
+        pixel_x = grid[...,0] * half + env_origins[:,0].view(B,1,1)
+        pixel_y = grid[...,1] * half + env_origins[:,1].view(B,1,1)
+
+        # ----- 2. Vector from robot → each pixel -----
+        dx = pixel_x - robot_pos_w[:,0].view(B,1,1)
+        dy = pixel_y - robot_pos_w[:,1].view(B,1,1)
+
+        # ----- 3. Angle of each pixel in robot's rotated frame -----
+        cos = torch.cos(robot_yaw_w).view(B,1,1)
+        sin = torch.sin(robot_yaw_w).view(B,1,1)
+
+        # rotate world vectors into robot frame
+        rx = dx * cos + dy * sin
+        ry = -dx * sin + dy * cos
+
+        # angle in [-π, π]
+        angles = torch.atan2(ry, rx)      # (B,H,W)
+
+        # convert to [0,2π)
+        angles = (angles + 2*np.pi) % (2*np.pi)
+
+        # ----- 4. Compute octant index 0..7 for each pixel -----
+        oct_idx = (angles / (np.pi/4)).long() % 8     # (B,H,W)
+
+        # ----- 5. Average staleness inside each octant -----
+        flat_map = self.staleness_maps.view(B, H*W)       # (B,HW)
+        flat_idx = oct_idx.view(B, H*W)                   # (B,HW)
+
+        out = torch.zeros(B, 8, device=device)
+        counts = torch.zeros(B, 8, device=device)
+
+        # scatter-add values
+        out.scatter_add_(1, flat_idx, flat_map)
+        counts.scatter_add_(1, flat_idx, torch.ones_like(flat_idx, dtype=torch.float))
+
+        # avoid division by zero
+        out = out / (counts + 1e-6)
+
+        return out
+
 
     def _sample_egocentric_maps(self, robot_pos_w, robot_yaw_w, lidar_hits_w, env_origins):
         cos = torch.cos(robot_yaw_w).squeeze(-1)
@@ -292,4 +314,4 @@ class MapManager:
     
     def reset(self, env_ids):
         # Reset specific environments
-        self.staleness_maps[env_ids] = 1.0
+        self.staleness_maps[env_ids] = 0.0

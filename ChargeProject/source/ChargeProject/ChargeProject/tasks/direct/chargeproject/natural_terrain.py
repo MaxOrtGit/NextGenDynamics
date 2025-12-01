@@ -19,7 +19,8 @@ class BlockCfg:
     """Defines a category of blocks (e.g. Debris vs Large Obstacles)."""
     weight: float = 1.0
     # (min, max) for base dimensions (X and Y)
-    width_range: Tuple[float, float] = (0.5, 1.0) 
+    x_width_range: Tuple[float, float] = (0.5, 1.0) 
+    y_width_range: Tuple[float, float] = (0.5, 1.0)
     # (min, max) for height STICKING OUT of ground
     height_range: Tuple[float, float] = (0.2, 0.5)
     # (min, max) multiplier for both width and height
@@ -242,20 +243,14 @@ def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple
 
     # --- 6. DYNAMIC BLOCKS (UPDATED) ---
     rng = np.random.default_rng(seed=cfg.seed)
-    spawn_origins_arr = np.array(spawn_origins_list) if len(spawn_origins_list) > 0 else np.empty((0,3))
+
+    spawn_centers_xy = np.array(spawn_origins_list)[:, :2]
     
     # Calculate type weights
     block_weights = np.array([b.weight for b in cfg.block_types])
     block_weights /= block_weights.sum() # Normalize
-    
-    # Max safe check
-    max_block_radius = 0.0
-    for b in cfg.block_types:
-        w_max = b.width_range[1] * b.scale_range[1]
-        max_block_radius = max(max_block_radius, w_max)
-    
-    safe_r_sq = (max_rad + max_block_radius)**2
 
+    max_attempts = cfg.num_blocks * 5 
     for _ in range(cfg.num_blocks):
         # 6a. Select Block Type
         b_type: BlockCfg = rng.choice(cfg.block_types, p=block_weights)
@@ -263,8 +258,8 @@ def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple
         # 6b. Generate Dimensions (Width, Height, Scale)
         # We generate random width (X) and length (Y) independently for variety, 
         # or share if you want perfect squares. Let's do independent.
-        raw_sx = rng.uniform(b_type.width_range[0], b_type.width_range[1])
-        raw_sy = rng.uniform(b_type.width_range[0], b_type.width_range[1])
+        raw_sx = rng.uniform(b_type.x_width_range[0], b_type.x_width_range[1])
+        raw_sy = rng.uniform(b_type.y_width_range[0], b_type.y_width_range[1])
         raw_h  = rng.uniform(b_type.height_range[0], b_type.height_range[1])
         
         global_scale = rng.uniform(b_type.scale_range[0], b_type.scale_range[1])
@@ -272,15 +267,43 @@ def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple
         sx = raw_sx * global_scale
         sy = raw_sy * global_scale
         h_above = raw_h * global_scale
+
+        # Calculate the "radius" of the block (half diagonal) to ensure corners don't clip
+        block_radius = np.hypot(sx, sy) / 2.0
+        
+        # Total safe distance: Block Radius + User Config Clearance
+        min_safe_dist =  block_radius + cfg.block_platform_clearance
         
         # 6c. Position
-        pos_x = rng.uniform(2.0, width_m - 2.0)
-        pos_y = rng.uniform(2.0, length_m - 2.0)
+        valid_pos = False
+        pos_x, pos_y = 0.0, 0.0
+        
+        for attempt in range(max_attempts):
+            max_attempts -= 1
+            pos_x = rng.uniform(2.0, width_m - 2.0)
+            pos_y = rng.uniform(2.0, length_m - 2.0)
+
+            # If there are no spawns, any position is valid
+            if len(spawn_centers_xy) == 0:
+                valid_pos = True
+                break
+
+            # Vectorized distance check against all spawns at once
+            # (pos_x, pos_y) vs all (spawn_x, spawn_y)
+            dists = np.sqrt((spawn_centers_xy[:, 0] - pos_x)**2 + (spawn_centers_xy[:, 1] - pos_y)**2)
+            
+            # If ALL distances are greater than the safety margin, we are good
+            if np.all(dists > min_safe_dist):
+                valid_pos = True
+                break
+        
+        # If we failed to find a valid spot after N attempts, skip this block
+        if not valid_pos:
+            print("Error: Could not find valid position for block after max attempts. Skipping block creation.")
+            break
 
         # Check spawn distance
-        if len(spawn_origins_arr) > 0:
-            d_sq = (pos_x - spawn_origins_arr[:,0])**2 + (pos_y - spawn_origins_arr[:,1])**2
-            if np.any(d_sq < safe_r_sq): continue
+        
 
         # 6d. Height Calculation (Burial)
         ix = int(pos_x / res)
@@ -346,35 +369,48 @@ class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
         # 1. Traversable Debris (Low, walkable)
         BlockCfg(
             weight=8.0,
-            width_range=(0.3, 0.6),
+            x_width_range=(0.3, 0.6),
+            y_width_range=(0.3, 0.6),
             height_range=(0.05, 0.15), # Low height
             scale_range=(1.0, 1.0),
         ),
         # 2. Medium Obstacles (might be climbable)
         BlockCfg(
             weight=1.0,
-            width_range=(0.4, 0.75),
+            x_width_range=(0.4, 0.75),
+            y_width_range=(0.4, 0.75),
             height_range=(0.3, 0.6),
             scale_range=(1.0, 1.5),
         ),
-        # 3. Giant Monoliths (Block the path)
+        # 3. Wall-like Obstacles
         BlockCfg(
-            weight=0.5,
-            width_range=(1.0, 2.0),
-            height_range=(1.5, 3.0),
-            scale_range=(1.0, 2.0),
-        )
+            weight=0.3,
+            x_width_range=(0.2, 0.5),
+            y_width_range=(1.5, 3.0),
+            height_range=(1.0, 1.5),
+            scale_range=(2.0, 4.0),
+        ),
+        # 4. Giant Monoliths (Block the path)
+        BlockCfg(
+            weight=0.3,
+            x_width_range=(1.0, 2.0),
+            y_width_range=(1.0, 2.0),
+            height_range=(1.0, 1.25),
+            scale_range=(1.5, 3.0),
+        ),
     ])
+
+    block_platform_clearance: float = 2.0  # Minimum distance from platform center
 
     num_spawns_per_side = 5
     spacing_m = 20.0  
     spawns_positions: np.ndarray = None
-    platform_width: float = 4.0
-    platform_flat_ratio: float = 0.5
+    platform_width: float = 5.0
+    platform_flat_ratio: float = 0.4
 
 terrain_gen_cfg = TerrainGeneratorCfg(
-    seed=42,
-    num_rows=1, num_cols=1, size=(150.0, 150.0),
+    seed=1,
+    num_rows=1, num_cols=1, size=(200.0, 200.0),
     sub_terrains={
         "main": MultiBiomeTerrainCfg(
             function=multi_biome_terrain,
