@@ -28,6 +28,42 @@ class BlockCfg:
     # How deep the object goes into the ground (meters)
     burial_depth: float = 4.0
 
+def check_rect_circle_overlap_vectorized(
+    circle_centers: np.ndarray, 
+    circle_radius: float, 
+    rect_center: np.ndarray, 
+    rect_dims: np.ndarray, 
+    rect_angle: float
+) -> bool:
+    # 1. Translate circles to be relative to the rectangle center
+    # Shape: (N, 2)
+    rel_pos = circle_centers - rect_center
+
+    # 2. Rotate the relative positions into the rectangle's local alignment
+    # We rotate by -rect_angle to align the rectangle with the axes
+    c, s = np.cos(-rect_angle), np.sin(-rect_angle)
+    
+    # Apply rotation matrix manually for vectorization
+    local_x = rel_pos[:, 0] * c - rel_pos[:, 1] * s
+    local_y = rel_pos[:, 0] * s + rel_pos[:, 1] * c
+
+    # 3. Find the closest point on the Axis-Aligned rectangle to the circle center
+    # Dimensions are full width, so extents are half-width
+    extent_x, extent_y = rect_dims[0] / 2.0, rect_dims[1] / 2.0
+    
+    closest_x = np.clip(local_x, -extent_x, extent_x)
+    closest_y = np.clip(local_y, -extent_y, extent_y)
+
+    # 4. Calculate distance from closest point to circle center
+    dist_x = local_x - closest_x
+    dist_y = local_y - closest_y
+    dist_sq = dist_x**2 + dist_y**2
+
+    # 5. Check collision (Distance squared < Radius squared)
+    overlaps = dist_sq < (circle_radius**2)
+    
+    return np.any(overlaps)
+
 def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple[list[trimesh.Trimesh], np.ndarray]:
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     
@@ -180,7 +216,7 @@ def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple
     z_l_br, z_l_tr = c_left[:, :, 1, 2], c_left[:, :, 2, 2]
     z_r_bl, z_r_tl = c_right[:, :, 0, 2], c_right[:, :, 3, 2]
     
-    gap_mask = (np.abs(z_l_br - z_r_bl) > 0.001) | (np.abs(z_l_tr - z_r_tl) > 0.001)
+    gap_mask = (np.abs(z_l_br - z_r_bl) > 0.0001) | (np.abs(z_l_tr - z_r_tl) > 0.0001)
     
     if np.any(gap_mask):
         wx = c_left[gap_mask, 1, 0]
@@ -238,6 +274,7 @@ def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple
     mesh_f = np.vstack(final_faces)
 
     ground_mesh = trimesh.Trimesh(vertices=mesh_v, faces=mesh_f, process=False)
+    ground_mesh.merge_vertices()
     
     meshes_list = [ground_mesh]
 
@@ -277,23 +314,29 @@ def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple
         # 6c. Position
         valid_pos = False
         pos_x, pos_y = 0.0, 0.0
+        theta = 0.0
         
         for attempt in range(max_attempts):
             max_attempts -= 1
             pos_x = rng.uniform(2.0, width_m - 2.0)
             pos_y = rng.uniform(2.0, length_m - 2.0)
+            theta = rng.uniform(0.0, 2.0 * np.pi)
 
             # If there are no spawns, any position is valid
             if len(spawn_centers_xy) == 0:
                 valid_pos = True
                 break
-
-            # Vectorized distance check against all spawns at once
-            # (pos_x, pos_y) vs all (spawn_x, spawn_y)
-            dists = np.sqrt((spawn_centers_xy[:, 0] - pos_x)**2 + (spawn_centers_xy[:, 1] - pos_y)**2)
+                
+            is_overlapping = check_rect_circle_overlap_vectorized(
+                spawn_centers_xy, 
+                cfg.block_platform_clearance, 
+                np.array([pos_x, pos_y]), 
+                np.array([sx, sy]), 
+                theta
+            )
             
             # If ALL distances are greater than the safety margin, we are good
-            if np.all(dists > min_safe_dist):
+            if not is_overlapping:
                 valid_pos = True
                 break
         
@@ -325,7 +368,7 @@ def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple
         
         box = trimesh.creation.box(extents=(sx, sy, total_h))
         transform = np.eye(4)
-        rot = trimesh.transformations.rotation_matrix(rng.uniform(0, 2*np.pi), [0, 0, 1])
+        rot = trimesh.transformations.rotation_matrix(theta, [0, 0, 1])
         transform[:3, :3] = rot[:3, :3]
         transform[:3, 3] = [pos_x, pos_y, final_block_z]
         box.apply_transform(transform)
@@ -340,11 +383,11 @@ def multi_biome_terrain(difficulty: float, cfg: "MultiBiomeTerrainCfg") -> tuple
 
 @configclass
 class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
-    grid_width: float = 0.125         
-    terrain_height: float = 5.0 # needs to be high enough for noise range 
+    grid_width: float = 0.25
+    terrain_height: float = 20.0 # needs to be high enough for noise range 
 
     # --- Terrain Shape (The Geometry) ---
-    noise_seed: int = 123
+    noise_seed: int = 1234
     noise_scale: float = 0.03       # Frequency of the Perlin noise (higher = more hills/valleys)
     noise_height_scale: float = 4.0 # Amplitude of the Perlin noise
     noise_octaves: int = 5
@@ -364,7 +407,7 @@ class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
     ])
 
     # --- Objects ---
-    num_blocks: int = 4000
+    num_blocks: int = 6000
     block_types: list[BlockCfg] = field(default_factory=lambda: [
         # 1. Traversable Debris (Low, walkable)
         BlockCfg(
@@ -376,7 +419,7 @@ class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
         ),
         # 2. Medium Obstacles (might be climbable)
         BlockCfg(
-            weight=1.0,
+            weight=0.7,
             x_width_range=(0.4, 0.75),
             y_width_range=(0.4, 0.75),
             height_range=(0.3, 0.6),
@@ -384,7 +427,7 @@ class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
         ),
         # 3. Wall-like Obstacles
         BlockCfg(
-            weight=0.3,
+            weight=0.25,
             x_width_range=(0.2, 0.5),
             y_width_range=(1.5, 3.0),
             height_range=(1.0, 1.5),
@@ -392,7 +435,7 @@ class MultiBiomeTerrainCfg(HfTerrainBaseCfg):
         ),
         # 4. Giant Monoliths (Block the path)
         BlockCfg(
-            weight=0.3,
+            weight=0.25,
             x_width_range=(1.0, 2.0),
             y_width_range=(1.0, 2.0),
             height_range=(1.0, 1.25),

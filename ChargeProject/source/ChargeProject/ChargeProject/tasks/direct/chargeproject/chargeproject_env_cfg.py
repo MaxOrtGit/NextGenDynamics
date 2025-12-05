@@ -204,10 +204,10 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
         track_air_time=True,
     )
 
-    visualize_nav_data = False
+    visualize_nav_data = True
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=int(25),
+        num_envs=int(1),
         env_spacing=4.0, 
         replicate_physics=True
     )
@@ -238,9 +238,9 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
 
     lidar_scanner = RayCasterCfg(
         prim_path=f"/World/envs/env_.*/Robot/{base_name}",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, robot_view_distance)),
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, robot_view_offset)),
         ray_alignment="yaw",
-        max_distance=32.0,
+        max_distance=robot_view_distance,
         pattern_cfg=#patterns.LidarPatternCfg(
         #    horizontal_fov_range=(-180.0, 180.0), # Full 360-degree sweep
         #    vertical_fov_range=(-40, 30),  # Looks 40 deg up and 30 deg down
@@ -279,10 +279,11 @@ class ChargeprojectEnvCfg(DirectRLEnvCfg):
     player_movement_angular_velocity = 0.5 # radians per second
     player_movement_speed = 1.0 # m/s
 
-    patrol_size = 48.0 # Meters (Area the robot is expected to search)
+    patrol_size = 18.0 # Meters (Area the robot is expected to search)
+    patrol_offset = 5.0 # Random offset from origin
     staleness_res = 1.0 # Meters (Resolution of staleness map)
     staleness_dim = int(patrol_size / staleness_res) # 64 pixels
-    staleness_decay_rate = 1/30 # 30 seconds from clean to fully stale
+    staleness_decay_rate = 1#/30 # 30 seconds from clean to fully stale
 
     nav_size = 24.0
     nav_dim = 33 # must line up with model input size

@@ -233,6 +233,7 @@ class ChargeprojectEnv(DirectRLEnv):
                         terrain_dims[1] + 2 * terrain_gen.border_width)
         
         self.map_manager = MapManager(self.cfg, self.num_envs, terrain_dims, self.device)
+        self._patrol_offset = torch.zeros(self.num_envs, 2, device=self.device)
 
         if self.cfg.cameras and self.cfg.visualize_nav_data:
             self._create_debug_visualizers()
@@ -249,6 +250,26 @@ class ChargeprojectEnv(DirectRLEnv):
 
         player_pos = self._player.data.root_pos_w
         self.can_see = self._can_see_player(player_pos)
+
+        torque_amount = 50.0  # Adjust magnitude (Nm) based on robot mass
+        
+        # 2. Prepare Tensors (on the correct device)
+        # Shape: (num_envs, 3) -> [x, y, z]
+        forces = torch.zeros((self.num_envs, 3), device=self.device)
+        torques = torch.zeros((self.num_envs, 3), device=self.device)
+
+        # 3. Set Z-axis Torque (Yaw rotation)
+        # [0, 0, amount] applies rotation around the vertical axis
+        torques[:, 2] = torque_amount 
+
+        # 4. Apply to the Robot
+        # body_ids=0 usually targets the Root/Base link of the robot
+        self._player.set_external_force_and_torque(
+            forces=forces,
+            torques=torques,
+            body_ids=[0],   # Apply only to the base link!
+            is_global=True  # True = Spin around World Z, False = Spin around Robot Local Z
+        )
 
         self.robot_state[caught_mask] = RobotState.PATROL
 
@@ -275,9 +296,11 @@ class ChargeprojectEnv(DirectRLEnv):
         
         self._previous_actions = self._actions.clone()
         
+        origins = self._get_origins()
+        origins[:, :2] += self._patrol_offset
         
         nav_data, far_staleness, self.last_exploration_bonus = self.map_manager.update(
-            self._get_origins(),
+            origins,
             self._robot.data.root_pos_w,
             self._robot.data.heading_w.unsqueeze(-1),
             self._lidar_sensor.data.ray_hits_w,
@@ -528,7 +551,7 @@ class ChargeprojectEnv(DirectRLEnv):
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-
+        
 
         self._respawn_players(env_ids)
         
@@ -539,7 +562,9 @@ class ChargeprojectEnv(DirectRLEnv):
         
         # Reset MapManager data
         self.map_manager.reset(env_ids)
-        
+        self._patrol_offset[env_ids] = torch.zeros_like(self._patrol_offset[env_ids]).uniform_(
+            -self.cfg.patrol_offset, self.cfg.patrol_offset
+        )
 
         extras = dict()
         for key in self._episode_sums.keys():
@@ -613,9 +638,9 @@ class ChargeprojectEnv(DirectRLEnv):
         if len(env_ids) == 0:
             return
 
-        # Get env origins (center of the world for that specific environment)
-        origins = self._get_origins()[env_ids]
-        
+        # Get env origins x, y
+        origins = self._get_origins()[env_ids, :2] + self._patrol_offset[env_ids]
+
         # 1. Random Angle (0 to 2pi)
         alpha = 2 * math.pi * torch.rand(len(env_ids), device=self.device)
         
@@ -826,7 +851,7 @@ class ChargeprojectEnv(DirectRLEnv):
             return
 
         env_id = 0
-        env_origin = self._get_origins()[env_id]
+        env_origin = self._get_origins()[env_id, :2] + self._patrol_offset[env_id]
         robot_pos = self._robot.data.root_pos_w[env_id]
         robot_quat = self._robot.data.root_quat_w[env_id]
 
@@ -935,7 +960,7 @@ class ChargeprojectEnv(DirectRLEnv):
 
 
         # Global Staleness Map Visualizers
-# Fetch raw map (Dim x Dim)
+        # Fetch raw map (Dim x Dim)
         base_stale_raw = self.map_manager.staleness_maps[env_id, 0] 
         dim = self.cfg.staleness_dim
         
@@ -1056,6 +1081,7 @@ class ChargeprojectEnv(DirectRLEnv):
         maps = [loco_map, stale_map, density_map, height_map, global_stale_map]
         
         for i, data in enumerate(maps):
+            data = np.rot90(data, k=-1)
             if self._viz_im_refs[i] is None:
                 self._viz_im_refs[i] = self._viz_axs[i].imshow(data, origin='lower', cmap='viridis')
                 self._viz_fig.colorbar(self._viz_im_refs[i], ax=self._viz_axs[i], fraction=0.046, pad=0.04)
@@ -1075,7 +1101,7 @@ class ChargeprojectEnv(DirectRLEnv):
 
         # We normalize color based on expected staleness range (e.g., 0.0 to 1.0 or dynamic)
         # Using dynamic max for visualization clarity
-        vmax = max(far_staleness_vals.max(), 1.0)
+        vmax = far_staleness_vals.max()
         norm = plt.Normalize(vmin=0, vmax=vmax)
         cmap = plt.get_cmap('viridis')
 
